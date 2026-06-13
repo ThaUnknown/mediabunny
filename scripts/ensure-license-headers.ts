@@ -15,7 +15,7 @@ const LICENSE_HEADER = `/*!
 const missingFiles: string[] = [];
 
 const checkFile = (filePath: string) => {
-	const content = fs.readFileSync(filePath, 'utf8');
+	const content = fs.readFileSync(filePath, 'utf8').replace(/\r/g, '');
 	if (!content.startsWith(LICENSE_HEADER)) {
 		missingFiles.push(filePath);
 	}

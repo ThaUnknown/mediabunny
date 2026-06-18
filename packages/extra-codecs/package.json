@@ -1,0 +1,63 @@
+{
+	"private": true,
+	"private": true,
+	"name": "@mediabunny/extra-codecs",
+	"author": "Vanilagy",
+	"version": "0.0.0",
+	"description": "Extra audio codec decoder extension for Mediabunny (DTS, TrueHD, AC-3, E-AC-3, FLAC, multichannel Opus), based on FFmpeg.",
+	"main": "./dist/bundles/mediabunny-extra-codecs.mjs",
+	"module": "./dist/bundles/mediabunny-extra-codecs.mjs",
+	"types": "./dist/modules/src/index.d.ts",
+	"exports": {
+		"types": "./dist/modules/src/index.d.ts",
+		"import": "./dist/bundles/mediabunny-extra-codecs.mjs",
+		"require": "./dist/bundles/mediabunny-extra-codecs.mjs"
+	},
+	"files": [
+		"README.md",
+		"package.json",
+		"LICENSE",
+		"FFMPEG_NOTICE.md",
+		"dist",
+		"src"
+	],
+	"browser": {
+		"worker_threads": false
+	},
+	"sideEffects": false,
+	"license": "(MPL-2.0 AND LGPL-2.1-or-later)",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Vanilagy/mediabunny.git",
+		"directory": "packages/extra-codecs"
+	},
+	"bugs": {
+		"url": "https://github.com/Vanilagy/mediabunny/issues"
+	},
+	"homepage": "https://mediabunny.dev",
+	"funding": {
+		"type": "individual",
+		"url": "https://github.com/sponsors/Vanilagy"
+	},
+	"peerDependencies": {
+		"mediabunny": "^1.0.0"
+	},
+	"devDependencies": {
+		"@types/emscripten": "^1.40.1"
+	},
+	"keywords": [
+		"dts",
+		"truehd",
+		"ac3",
+		"eac3",
+		"flac",
+		"opus",
+		"decoding",
+		"codec",
+		"mediabunny",
+		"ffmpeg",
+		"browser",
+		"wasm",
+		"polyfill"
+	]
+}

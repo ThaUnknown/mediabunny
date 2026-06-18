@@ -1,0 +1,21 @@
+# License
+
+## MPL-2.0 (Mediabunny code)
+
+The TypeScript source files, C bridge source, build scripts, and documentation in this package are licensed under the Mozilla Public License Version 2.0, the full text of which can be found at https://mozilla.org/MPL/2.0/.
+
+## LGPL-2.1-or-later (FFmpeg)
+
+This package incorporates the FFmpeg library compiled to WebAssembly. FFmpeg is licensed under the GNU Lesser General Public License version 2.1 or later. See FFMPEG_NOTICE.md for the build configuration and source information.
+
+FFmpeg is free software; you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation; either version 2.1 of the License, or (at your option) any later version.
+
+The complete corresponding source code for FFmpeg is available at:
+https://github.com/FFmpeg/FFmpeg
+
+The build scripts used to produce the FFmpeg binary in this package are available at:
+https://github.com/Vanilagy/mediabunny/tree/main/packages/extra-codecs
+
+## Combined work
+
+As a whole, this package is distributed under the terms of both the MPL-2.0 and LGPL-2.1-or-later licenses. You may choose to follow the terms of either license where they apply to your use of the respective components, provided that all terms of both licenses are satisfied where applicable.

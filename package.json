@@ -38,7 +38,8 @@
   },
   "sideEffects": false,
   "scripts": {
-    "build": "./scripts/build.sh",
+    "build": "tsc -p packages/flac-encoder --noCheck",
+    "buildw": "api-extractor run -c packages/flac-encoder/api-extractor.json",
     "watch": "tsx scripts/bundle.ts --watch",
     "lint": "eslint .",
     "test": "npm run pre-test && npx vitest --run",

@@ -2132,7 +2132,7 @@ class PacketReadingContext {
 							|| nalUnitType === AvcNalUnitType.SPS
 							|| nalUnitType === AvcNalUnitType.PPS
 							|| nalUnitType === AvcNalUnitType.AUD;
-					} else if (codec !== 'vvc') {
+					} else {
 						nalUnitType = extractNalUnitTypeForHevc(headerByte0);
 						const layerId = ((headerByte0 & 1) << 5) | (chunk[nalHeaderStart + 1]! >> 3);
 						if (layerId > 0) {
@@ -2161,7 +2161,7 @@ class PacketReadingContext {
 							const firstMacroblockInSlice = readExpGolomb(new Bitstream(headerBytes));
 							startsNewPicture = !frameStartFound || firstMacroblockInSlice <= lastFirstMacroblockInSlice;
 							lastFirstMacroblockInSlice = firstMacroblockInSlice;
-						} else if (codec !== 'vvc') {
+						} else {
 							startsNewPicture = (chunk[payloadStart]! >> 7) === 1;
 						}
 

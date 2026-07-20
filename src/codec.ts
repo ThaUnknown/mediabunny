@@ -571,7 +571,7 @@ export const extractVideoCodecString = (trackInfo: {
 		return proresFormat ?? 'apch';
 	} else if (codec === 'vvc') {
 		// TODO: implement
-		return null;
+		throw new Error('todo');
 	} else if (codec !== null) {
 		assertNever(codec);
 	}

@@ -41,6 +41,7 @@ Mediabunny ships with built-in decoders and encoders for all audio PCM codecs, m
 - `'vp9'` - VP9
 - `'av1'` - AOMedia Video 1 (AV1)
 - `'vvc'` - Versatile Video Coding (VVC) / H.266
+- `'prores'` - Apple ProRes [^prores]
 
 ### Audio codecs
 
@@ -85,6 +86,7 @@ Not all codecs can be used with all containers. The following table specifies th
 | `'vp9'`        |    ✓     |   ✓   |   ✓   |     ✓     |       |       |       |       |       |       |
 | `'av1'`        |    ✓     |   ✓   |   ✓   |     ✓     |       |       |       |       |       |       |
 | `'vvc'`        |    ✓     |   ✓   |   ✓   |           |       |       |       |       |       |   ✓   |
+| `'prores'`     |    ✓     |   ✓   |   ✓   |           |       |       |       |       |       |       |
 | `'aac'`        |    ✓     |   ✓   |   ✓   |           |       |       |       |   ✓   |       |   ✓   |
 | `'opus'`       |    ✓     |   ✓   |   ✓   |     ✓     |   ✓   |       |       |       |       |       |
 | `'mp3'`        |    ✓     |   ✓   |   ✓   |           |       |   ✓   |       |       |       |   ✓   |
@@ -113,6 +115,7 @@ Not all codecs can be used with all containers. The following table specifies th
 
 For HLS, the supported codecs depend on the segment format chosen.
 
+[^prores]: ProRes is not supported by WebCodecs. To decode it, use the [`@mediabunny/prores`](./extensions/prores) extension package. The [`@mediabunny/server`](./extensions/server) extension package provides both decoding and encoding support for server-side environments.
 [^aac]: In some browsers, AAC encoding is not supported by WebCodecs. You can polyfill it with the [`@mediabunny/aac-encoder`](./extensions/aac-encoder) extension package.
 [^mp3]: MP3 encoding is not supported by WebCodecs. You can polyfill it with the [`@mediabunny/mp3-encoder`](./extensions/mp3-encoder) extension package.
 [^flac]: FLAC encoding is not supported by WebCodecs. You can polyfill it with the [`@mediabunny/flac-encoder`](./extensions/flac-encoder) extension package.
@@ -301,10 +304,13 @@ class {
 	codec: AudioCodec;
 	config: AudioEncoderConfig;
 	onPacket: (packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) => unknown;
+
+	// For both:
+	onError: (error: unknown) => void;
 }
 ```
 
-`codec` and `config` specify the concrete codec configuration to use, and `onPacket` is a method that your code **must** call for each encoded packet it creates.
+`codec` and `config` specify the concrete codec configuration to use, and `onPacket` is a method that your code **must** call for each encoded packet it creates. `onError` is a method you can call to surface any out-of-band errors that occur outside of the regular method calls (such as from an asynchronous background task); these errors would otherwise go uncaught.
 
 You **must** implement the following methods in your custom encoder class:
 ```ts
@@ -364,10 +370,13 @@ class {
 	codec: AudioCodec;
 	config: AudioDecoderConfig;
 	onSample: (sample: AudioSample) => unknown;
+
+	// For both:
+	onError: (error: unknown) => void;
 }
 ```
 
-`codec` and `config` specify the concrete codec configuration to use, and `onSample` is a method that your code **must** call for each video/audio sample it creates.
+`codec` and `config` specify the concrete codec configuration to use, and `onSample` is a method that your code **must** call for each video/audio sample it creates. `onError` is a method you can call to surface any out-of-band errors that occur outside of the regular method calls (such as from an asynchronous background task); these errors would otherwise go uncaught.
 
 You **must** implement the following methods in your custom decoder class:
 ```ts

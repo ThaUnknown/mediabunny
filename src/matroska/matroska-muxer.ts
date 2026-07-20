@@ -87,6 +87,7 @@ type InternalMediaChunk = {
 type MatroskaTrackData = {
 	chunkQueue: InternalMediaChunk[];
 	lastWrittenMsTimestamp: number | null;
+	codecPrivate: AllowSharedBufferSource | null;
 	closed: boolean;
 } & ({
 	track: OutputVideoTrack;
@@ -334,6 +335,9 @@ export class MatroskaMuxer extends Muxer {
 				{ id: EBMLId.FlagLacing, data: 0 },
 				{ id: EBMLId.Language, data: trackData.track.metadata.languageCode ?? UNDETERMINED_LANGUAGE },
 				{ id: EBMLId.CodecID, data: codecId },
+				trackData.codecPrivate
+					? { id: EBMLId.CodecPrivate, data: toUint8Array(trackData.codecPrivate) }
+					: null,
 				{ id: EBMLId.CodecDelay, data: 0 },
 				{ id: EBMLId.SeekPreRoll, data: seekPreRollNs },
 				trackData.track.metadata.name !== undefined
@@ -350,12 +354,6 @@ export class MatroskaMuxer extends Muxer {
 		const { frameRate, rotation } = trackData.track.metadata;
 
 		const elements: EBMLElement['data'] = [
-			(trackData.info.decoderConfig.description
-				? {
-						id: EBMLId.CodecPrivate,
-						data: toUint8Array(trackData.info.decoderConfig.description),
-					}
-				: null),
 			(frameRate
 				? {
 						id: EBMLId.DefaultDuration,
@@ -432,12 +430,6 @@ export class MatroskaMuxer extends Muxer {
 			: null;
 
 		return [
-			(trackData.info.decoderConfig.description
-				? {
-						id: EBMLId.CodecPrivate,
-						data: toUint8Array(trackData.info.decoderConfig.description),
-					}
-				: null),
 			{ id: EBMLId.Audio, data: [
 				{ id: EBMLId.SamplingFrequency, data: new EBMLFloat32(trackData.info.sampleRate) },
 				{ id: EBMLId.Channels, data: trackData.info.numberOfChannels },
@@ -446,10 +438,9 @@ export class MatroskaMuxer extends Muxer {
 		];
 	}
 
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	private subtitleSpecificTrackInfo(trackData: MatroskaSubtitleTrackData) {
-		return [
-			{ id: EBMLId.CodecPrivate, data: textEncoder.encode(trackData.info.config.description) },
-		];
+		return [];
 	}
 
 	private maybeCreateTags() {
@@ -768,28 +759,26 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
+			codecPrivate: meta.decoderConfig.description ?? null,
 			closed: false,
 		};
 
 		if (track.source._codec === 'vp9') {
 			// https://www.webmproject.org/docs/container specifies that VP9 "SHOULD" make use of the CodecPrivate
 			// field. Since WebCodecs makes no use of the description field for VP9, we need to derive it ourselves:
-			newTrackData.info.decoderConfig = {
-				...newTrackData.info.decoderConfig,
-				description: new Uint8Array(
-					generateVp9CodecConfigurationFromCodecString(newTrackData.info.decoderConfig.codec),
-				),
-			};
+			newTrackData.codecPrivate = new Uint8Array(
+				generateVp9CodecConfigurationFromCodecString(newTrackData.info.decoderConfig.codec),
+			);
 		} else if (track.source._codec === 'av1') {
 			// Per https://github.com/ietf-wg-cellar/matroska-specification/blob/master/codec/av1.md, AV1 requires
 			// CodecPrivate to be set, but WebCodecs makes no use of the description field for AV1. Thus, let's derive
 			// it ourselves:
-			newTrackData.info.decoderConfig = {
-				...newTrackData.info.decoderConfig,
-				description: new Uint8Array(
-					generateAv1CodecConfigurationFromCodecString(newTrackData.info.decoderConfig.codec),
-				),
-			};
+			newTrackData.codecPrivate = new Uint8Array(
+				generateAv1CodecConfigurationFromCodecString(newTrackData.info.decoderConfig.codec),
+			);
+		} else if (track.source._codec === 'prores') {
+			// "The Private Data contains the FourCC as found in MP4 movies"
+			newTrackData.codecPrivate = textEncoder.encode(meta.decoderConfig.codec);
 		}
 
 		this.trackDatas.push(newTrackData);
@@ -855,6 +844,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
+			codecPrivate: decoderConfig.description ?? null,
 			closed: false,
 		};
 
@@ -887,6 +877,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
+			codecPrivate: textEncoder.encode(meta.config.description),
 			closed: false,
 		};
 
@@ -906,6 +897,17 @@ export class MatroskaMuxer extends Muxer {
 		try {
 			const trackData = this.getVideoTrackData(track, packet, meta);
 
+			let packetData = packet.data;
+			if (track.source._codec === 'prores') {
+				if (packetData.byteLength < 8) {
+					throw new Error('ProRes packet too small, expected at least 8 bytes.');
+				}
+
+				// Trim off the frame container atom header. FFmpeg does this too and cites the "Matroska spec" as the
+				// reason, despite the spec not saying anything about this.
+				packetData = packetData.subarray(8);
+			}
+
 			const isKeyFrame = packet.type === 'key';
 			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
 
@@ -922,7 +924,7 @@ export class MatroskaMuxer extends Muxer {
 				? packet.sideData.alpha ?? null
 				: null;
 
-			const videoChunk = this.createInternalChunk(packet.data, timestamp, duration, packet.type, additions);
+			const videoChunk = this.createInternalChunk(packetData, timestamp, duration, packet.type, additions);
 			if (track.source._codec === 'vp9') this.fixVP9ColorSpace(trackData, videoChunk);
 
 			trackData.chunkQueue.push(videoChunk);
@@ -1166,7 +1168,10 @@ export class MatroskaMuxer extends Muxer {
 
 		const msDuration = Math.round(1000 * chunk.duration);
 
-		if (!chunk.additions) {
+		// Subtitle cues need an explicit BlockDuration (a SimpleBlock has none)
+		const needsBlockGroup = !!chunk.additions || trackData.type === 'subtitle';
+
+		if (!needsBlockGroup) {
 			// No additions, we can write out a SimpleBlock
 			view.setUint8(3, Number(chunk.type === 'key') << 7); // Flags (keyframe flag only present for SimpleBlock)
 

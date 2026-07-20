@@ -20,6 +20,8 @@ import {
 	extractVideoCodecString,
 	MediaCodec,
 	OPUS_SAMPLE_RATE,
+	PRORES_FOURCCS,
+	ProresFourCc,
 	VideoCodec,
 } from '../codec';
 import { Demuxer } from '../demuxer';
@@ -43,6 +45,8 @@ import {
 	normalizeRotation,
 	Rotation,
 	roundIfAlmostInteger,
+	textDecoder,
+	toDataView,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
@@ -138,6 +142,7 @@ type ClusterBlock = {
 	data: Uint8Array;
 	lacing: BlockLacing;
 	decoded: boolean;
+	postProcessed: boolean; // For codec-specific processing
 	mainAdditional: Uint8Array | null;
 };
 
@@ -214,6 +219,7 @@ type InternalTrack = {
 			codecDescription: Uint8Array | null;
 			colorSpace: VideoColorSpaceInit | null;
 			alphaMode: boolean;
+			proresFormat: ProresFourCc | null;
 		}
 		| {
 			type: 'audio';
@@ -860,6 +866,7 @@ export class MatroskaDemuxer extends Demuxer {
 					data: frameData,
 					lacing: BlockLacing.None,
 					decoded: true,
+					postProcessed: false,
 					mainAdditional: originalBlock.mainAdditional,
 				});
 			}
@@ -1080,6 +1087,18 @@ export class MatroskaDemuxer extends Demuxer {
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.vvc) {
 							this.currentTrack.info.codec = 'vvc';
 							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
+						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.prores) {
+							const format = this.currentTrack.codecPrivate
+								? textDecoder.decode(this.currentTrack.codecPrivate)
+								: '';
+
+							if ((PRORES_FOURCCS as readonly string[]).includes(format)) {
+								this.currentTrack.info.codec = 'prores';
+								this.currentTrack.info.proresFormat = format as ProresFourCc;
+							} else {
+								// Either an invalid string or ProRes RAW, which we don't support yet (it's a
+								// different codec).
+							}
 						}
 
 						const videoTrack = this.currentTrack as InternalVideoTrack;
@@ -1182,6 +1201,7 @@ export class MatroskaDemuxer extends Demuxer {
 						codecDescription: null,
 						colorSpace: null,
 						alphaMode: false,
+						proresFormat: null,
 					};
 				} else if (type === 2) {
 					this.currentTrack.info = {
@@ -1497,6 +1517,7 @@ export class MatroskaDemuxer extends Demuxer {
 					data: blockData,
 					lacing,
 					decoded: !hasDecodingInstructions,
+					postProcessed: false,
 					mainAdditional: null,
 				});
 			}; break;
@@ -1533,6 +1554,7 @@ export class MatroskaDemuxer extends Demuxer {
 					data: blockData,
 					lacing,
 					decoded: !hasDecodingInstructions,
+					postProcessed: false,
 					mainAdditional: null,
 				};
 				trackData.blocks.push(this.currentBlock);
@@ -2189,6 +2211,35 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			block.decoded = true;
 		}
 
+		if (!block.postProcessed) {
+			if (this.internalTrack.info?.codec === 'prores') {
+				// For some reason, ProRes packets are stored in Matroska without the frame container atom. FFmpeg cites
+				// the "Matroska spec" but the actual spec says nothing about this.
+
+				const hasFrameContainer = block.data.length >= 8
+					&& block.data[4] === 105 // 'i'
+					&& block.data[5] === 99 // 'c'
+					&& block.data[6] === 112 // 'p'
+					&& block.data[7] === 102; // 'f'
+
+				if (!hasFrameContainer) {
+					// Wrap the frame in a frame container
+					const newData = new Uint8Array(block.data.length + 8);
+					const newDataView = toDataView(newData);
+
+					newDataView.setUint32(0, newData.length, false);
+					newData[4] = 105; // 'i'
+					newData[5] = 99; // 'c'
+					newData[6] = 112; // 'p'
+					newData[7] = 102; // 'f'
+					newData.set(block.data, 8);
+					block.data = newData;
+				}
+			}
+
+			block.postProcessed = true;
+		}
+
 		const data = options.metadataOnly ? PLACEHOLDER_DATA : block.data;
 		const timestamp = block.timestamp / this.internalTrack.segment.timestampFactor;
 		const duration = block.duration / this.internalTrack.segment.timestampFactor;
@@ -2447,7 +2498,12 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 	}
 
 	async canBeTransparent() {
-		return this.internalTrack.info.alphaMode;
+		return this.internalTrack.info.alphaMode || (
+			this.internalTrack.info.codec === 'prores' && (
+				this.internalTrack.info.proresFormat === 'ap4h'
+				|| this.internalTrack.info.proresFormat === 'ap4x'
+			)
+		);
 	}
 
 	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
@@ -2489,6 +2545,7 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 					av1CodecInfo: this.internalTrack.info.codec === 'av1' && firstPacket
 						? extractAv1CodecInfoFromPacket(firstPacket.data)
 						: null,
+					proresFormat: this.internalTrack.info.proresFormat,
 				}),
 				codedWidth: this.internalTrack.info.width,
 				codedHeight: this.internalTrack.info.height,

@@ -44,14 +44,6 @@ Mediabunny is a JavaScript library for reading, writing, and converting media (l
   </a>
 </div>
 
-### Silver sponsors
-
-<div align="center">
-  <a href="https://ponder.ai/" target="_blank" rel="sponsored">
-    <img src="./docs/public/sponsors/ponder.png" width="50" height="50" alt="Ponder">
-  </a>
-</div>
-
 ### Bronze sponsors
 
 <div align="center">
@@ -69,6 +61,10 @@ Mediabunny is a JavaScript library for reading, writing, and converting media (l
   &nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://jellypod.ai/" target="_blank" rel="sponsored">
     <img src="./docs/public/sponsors/jellypod.png" width="40" height="40" alt="Jellypod">
+  </a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.photocircleapp.com/" target="_blank" rel="sponsored">
+    <img src="./docs/public/sponsors/photocircle.png" width="40" height="40" alt="PhotoCircle">
   </a>
 </div>
 

@@ -25,15 +25,6 @@ jobs:
         with:
           script: "core.setFailed('Non-prerelease releases must target the main branch (got: ${{ github.event.release.target_commitish }}).')"
 
-      - name: Merge main into release branch
-        if: ${{ !github.event.release.prerelease }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout release
-          git merge origin/main --no-ff -m "Merge main into release for tag ${{ github.event.release.tag_name }}"
-          git push origin release
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -60,8 +51,9 @@ jobs:
       - name: Run tests
         run: xvfb-run npm test
 
-      - name: Run build
-        run: npm run build
+      # Building the docs also builds the core library
+      - name: Build everything
+        run: npm run docs:build
 
       - name: Upload build artifacts
         env:
@@ -93,6 +85,11 @@ jobs:
           packages/flac-encoder/dist/bundles/mediabunny-flac-encoder.mjs
           packages/flac-encoder/dist/bundles/mediabunny-flac-encoder.min.mjs
           packages/flac-encoder/dist/mediabunny-flac-encoder.d.ts
+          packages/prores/dist/bundles/mediabunny-prores.js
+          packages/prores/dist/bundles/mediabunny-prores.min.js
+          packages/prores/dist/bundles/mediabunny-prores.mjs
+          packages/prores/dist/bundles/mediabunny-prores.min.mjs
+          packages/prores/dist/mediabunny-prores.d.ts
           packages/server/dist/bundles/mediabunny-server.cjs
           packages/server/dist/bundles/mediabunny-server.min.cjs
           packages/server/dist/bundles/mediabunny-server.mjs
@@ -101,3 +98,12 @@ jobs:
 
       - name: Publish workspace packages to npm
         run: npm publish --access public --workspaces ${{ github.event.release.prerelease && '--tag beta' || '' }}
+
+      - name: Merge main into release branch
+        if: ${{ !github.event.release.prerelease }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout release
+          git merge origin/main --no-ff -m "Merge main into release for tag ${{ github.event.release.tag_name }}"
+          git push origin release

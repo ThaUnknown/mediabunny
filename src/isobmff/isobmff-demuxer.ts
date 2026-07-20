@@ -18,6 +18,8 @@ import {
 	parsePcmCodec,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
+	PRORES_FOURCCS,
+	ProresFourCc,
 	VideoCodec,
 } from '../codec';
 import {
@@ -147,6 +149,7 @@ type InternalTrack = {
 		hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 		vp9CodecInfo: Vp9CodecInfo | null;
 		av1CodecInfo: Av1CodecInfo | null;
+		proresFormat: ProresFourCc | null;
 	};
 } | {
 	info: {
@@ -1008,6 +1011,7 @@ export class IsobmffDemuxer extends Demuxer {
 						hevcCodecInfo: null,
 						vp9CodecInfo: null,
 						av1CodecInfo: null,
+						proresFormat: null,
 					};
 				} else if (handlerType === 'soun') {
 					track.info = {
@@ -1095,6 +1099,9 @@ export class IsobmffDemuxer extends Demuxer {
 							track.info.codec = 'av1';
 						} else if (codecName === 'vvc1' || codecName === 'vvi1') {
 							track.info.codec = 'vvc';
+						} else if ((PRORES_FOURCCS as readonly string[]).includes(lowercaseBoxName)) {
+							track.info.codec = 'prores';
+							track.info.proresFormat = lowercaseBoxName as ProresFourCc;
 						} else if (codecName === null) {
 							Logging._warn(`Unknown encrypted video codec due to missing frma box.`);
 						} else {
@@ -3354,7 +3361,10 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 	}
 
 	async canBeTransparent() {
-		return false;
+		return this.internalTrack.info.codec === 'prores' && (
+			this.internalTrack.info.proresFormat === 'ap4h'
+			|| this.internalTrack.info.proresFormat === 'ap4x'
+		);
 	}
 
 	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {

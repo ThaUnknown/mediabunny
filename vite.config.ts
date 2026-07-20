@@ -21,10 +21,14 @@ export default defineConfig({
 	resolve: {
 		alias: {
 			'mediabunny': path.resolve(__dirname, './dist/bundles/mediabunny.mjs'),
+			'@mediabunny/ac3':
+				path.resolve(__dirname, './packages/ac3/dist/bundles/mediabunny-ac3.mjs'),
 			'@mediabunny/aac-encoder':
 				path.resolve(__dirname, './packages/aac-encoder/dist/bundles/mediabunny-aac-encoder.mjs'),
 			'@mediabunny/flac-encoder':
 				path.resolve(__dirname, './packages/flac-encoder/dist/bundles/mediabunny-flac-encoder.mjs'),
+			'@mediabunny/prores':
+				path.resolve(__dirname, './packages/prores/dist/bundles/mediabunny-prores.mjs'),
 		},
 	},
 	plugins: [
@@ -33,6 +37,10 @@ export default defineConfig({
 	server: {
 		hmr: false,
 		allowedHosts: true,
+		headers: {
+			'Cross-Origin-Opener-Policy': 'same-origin',
+			'Cross-Origin-Embedder-Policy': 'require-corp',
+		},
 	},
 	build: {
 		outDir: 'dist-docs', // Build them directly into the docs build folder

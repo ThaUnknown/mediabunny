@@ -54,6 +54,7 @@ import {
 	AudioSample,
 	clampCropRectangle,
 	CropRectangle,
+	getBytesPerSample,
 	validateCropRectangle,
 	VideoSample,
 	VideoSampleResource,
@@ -837,7 +838,7 @@ export class Conversion {
 		if (this._options.trim?.start !== undefined) {
 			this._startTimestamp = this._options.trim.start;
 		} else {
-			// Compute the start timestamp from the set of filtered tracks. Techncially these can still be narrowed
+			// Compute the start timestamp from the set of filtered tracks. Technically these can still be narrowed
 			// down later due to discarded tracks, but we need to fix the start timestamp now due to track processing
 			// depending on it.
 			this._startTimestamp = Math.max(
@@ -1320,7 +1321,7 @@ export class Conversion {
 				await tempOutput.start();
 
 				const sink = new VideoSampleSink(track);
-				const firstSample = await sink.getSample(firstTimestamp); // Let's just use the first sample
+				using firstSample = await sink.getSample(firstTimestamp); // Let's just use the first sample
 
 				if (firstSample) {
 					try {
@@ -1328,9 +1329,13 @@ export class Conversion {
 						firstSample.close();
 						await tempOutput.finalize();
 					} catch (error) {
-						Logging._info('Error when probing encoder support. Falling back to rerender path.', error);
-						needsRerender = true;
+						Logging._warn(
+							'An error occurred when probing encoder support. Falling back to rerender path.', error,
+						);
 						void tempOutput.cancel();
+
+						needsRerender = true;
+						encodingConfig.transform.force = true;
 					}
 				} else {
 					await tempOutput.cancel();
@@ -1370,9 +1375,8 @@ export class Conversion {
 
 				const sink = new VideoSampleSink(track);
 
-				for await (const sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
+				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
 					if (this._canceled) {
-						sample.close();
 						return;
 					}
 
@@ -1381,14 +1385,13 @@ export class Conversion {
 
 					this._reportProgress(outputTrackId, sample.timestamp + sample.duration);
 					await source.add(sample);
+					sample.close();
 
 					if (lastSampleTimestamp !== null) {
 						if (this._synchronizer.shouldWait(outputTrackId, lastSampleTimestamp)) {
 							await this._synchronizer.wait(lastSampleTimestamp);
 						}
 					}
-
-					sample.close();
 				}
 
 				source.close();
@@ -1442,7 +1445,7 @@ export class Conversion {
 		let sampleRate = trackOptions.sampleRate ?? originalSampleRate;
 
 		const needsTrimming = firstTimestamp < this._startTimestamp;
-		const needsPadding = firstTimestamp > this._startTimestamp && !this.output.format.supportsTimestampedMediaData;
+		let needsPadding = firstTimestamp > this._startTimestamp && !this.output.format.supportsTimestampedMediaData;
 
 		let audioCodecs = this.output.format.getSupportedAudioCodecs();
 		if (
@@ -1589,25 +1592,35 @@ export class Conversion {
 			this._trackPromises.push((async () => {
 				await this._started;
 
-				if (needsPadding) {
-					const paddingLength = firstTimestamp - this._startTimestamp;
-					const paddingLengthSamples = Math.round(paddingLength * originalSampleRate);
-
-					const silentSample = new AudioSample({
-						data: new Float32Array(paddingLengthSamples * originalNumberOfChannels),
-						format: 'f32-planar',
-						numberOfChannels: originalNumberOfChannels,
-						sampleRate: originalSampleRate,
-						timestamp: 0,
-					});
-					await this._registerAudioSample(silentSample, source, outputTrackId, () => lastSampleTimestamp);
-				}
-
 				const sink = new AudioSampleSink(track);
-				for await (let sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
+				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
 					if (this._canceled) {
-						sample.close();
 						return;
+					}
+
+					if (needsPadding) {
+						// Add one padding sample at the beginning
+						const paddingLength = firstTimestamp - this._startTimestamp;
+						const paddingLengthSamples = Math.round(paddingLength * originalSampleRate);
+
+						const bytesPerSample = getBytesPerSample(sample.format);
+						const data = new Uint8Array(bytesPerSample * paddingLengthSamples * originalNumberOfChannels);
+						if (sample.format === 'u8' || sample.format === 'u8-planar') {
+							data.fill(2 ** 7); // Fill it with the silent value
+						}
+
+						using silentSample = new AudioSample({
+							data,
+							// Use the same format the decoder is spitting out. This avoids feeding changing sample
+							// formats to the audio encoder.
+							format: sample.format,
+							numberOfChannels: originalNumberOfChannels,
+							sampleRate: originalSampleRate,
+							timestamp: 0,
+						});
+						await this._registerAudioSample(silentSample, source, outputTrackId, () => lastSampleTimestamp);
+
+						needsPadding = false;
 					}
 
 					let startFrame = 0;
@@ -1620,22 +1633,28 @@ export class Conversion {
 						endFrame = Math.round((this._endTimestamp - sample.timestamp) * sample.sampleRate);
 					}
 
+					// Can't assign to "using" identifiers so we gotta do this
+					let finalSampleLet: AudioSample;
 					if (startFrame > 0 || endFrame < sample.numberOfFrames) {
 						// Trim the sample if it sticks out of the trim region on either end
 						const trimmedSample = sample.trim(startFrame, endFrame);
 						sample.close();
-						sample = trimmedSample;
+						finalSampleLet = trimmedSample;
 
-						if (sample.numberOfFrames === 0) {
-							sample.close();
+						if (trimmedSample.numberOfFrames === 0) {
+							trimmedSample.close();
 							continue;
 						}
+					} else {
+						finalSampleLet = sample;
 					}
 
-					// Offset the timestamp as needed
-					sample.setTimestamp(sample.timestamp - this._startTimestamp);
+					using finalSample = finalSampleLet;
 
-					await this._registerAudioSample(sample, source, outputTrackId, () => lastSampleTimestamp);
+					// Offset the timestamp as needed
+					finalSample.setTimestamp(finalSample.timestamp - this._startTimestamp);
+
+					await this._registerAudioSample(finalSample, source, outputTrackId, () => lastSampleTimestamp);
 				}
 
 				source.close();

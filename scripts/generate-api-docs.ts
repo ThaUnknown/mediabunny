@@ -127,15 +127,22 @@ const generateDocs = (entryFiles: string[], apiConfigFile: string, dry = false) 
 			const declaration = exportSymbol.valueDeclaration || exportSymbol.declarations?.[0];
 			if (!declaration) return;
 
-			// If it's a reexport, follow it recursively
+			// If it's a reexport, resolve it to the underlying symbol (following chains of aliases,
+			// e.g. a re-export of a re-export) rather than recursing into the whole module it lives in
+			// -- `getExportsOfModule` above already gives us one entry per exported symbol, so a module
+			// recursion here would revisit (and duplicate) every other export of that module too.
 			if (exportSymbol.flags & ts.SymbolFlags.Alias) {
-				const aliasedSymbol = typeChecker.getAliasedSymbol(exportSymbol);
+				let aliasedSymbol = typeChecker.getAliasedSymbol(exportSymbol);
+				while (aliasedSymbol.flags & ts.SymbolFlags.Alias) {
+					aliasedSymbol = typeChecker.getAliasedSymbol(aliasedSymbol);
+				}
 				const aliasedDeclaration = aliasedSymbol.valueDeclaration || aliasedSymbol.declarations?.[0];
 				if (aliasedDeclaration) {
-					const sourceFile = aliasedDeclaration.getSourceFile();
-					const moduleSymbol = typeChecker.getSymbolAtLocation(sourceFile);
-					if (moduleSymbol) {
-						symbols.push(...getAllExportedSymbols(moduleSymbol, visited));
+					// Push the aliased symbol (not the alias) so downstream sees the real
+					// declaration and its JSDoc rather than the empty ExportSpecifier.
+					const hasPublicTag = ts.getJSDocTags(aliasedDeclaration).some(tag => tag.tagName.text === 'public');
+					if (hasPublicTag) {
+						symbols.push(aliasedSymbol);
 					}
 				}
 			}

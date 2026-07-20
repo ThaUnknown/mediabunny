@@ -102,14 +102,13 @@ const sponsors = {
 		{ image: '/sponsors/screen-studio.webp', name: 'Screen Studio', url: 'https://screen.studio/' },
 		{ image: '/sponsors/tella.svg', name: 'Tella', url: 'https://www.tella.com/' },
 	],
-	silver: [
-		{ image: '/sponsors/ponder.png', name: 'Ponder', url: 'https://ponder.ai/' },
-	],
+	silver: [],
 	bronze: [
 		{ image: '/sponsors/elevenlabs.png', name: 'ElevenLabs', url: 'https://elevenlabs.io/' },
 		{ image: '/sponsors/rve.png', name: 'React Video Editor', url: 'https://www.reactvideoeditor.com/' },
 		{ image: '/sponsors/mux.jpg', name: 'Mux', url: 'https://www.mux.com/' },
 		{ image: '/sponsors/jellypod.png', name: 'Jellypod', url: 'https://jellypod.ai/' },
+		{ image: '/sponsors/photocircle.png', name: 'PhotoCircle', url: 'https://www.photocircleapp.com/' },
 	],
 	individual: [
 		{ image: '/sponsors/pintura-labs.png', name: 'Pintura Labs', url: 'https://pqina.nl/pintura/' },

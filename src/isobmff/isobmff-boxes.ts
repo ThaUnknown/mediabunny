@@ -722,7 +722,7 @@ export const videoSampleDescription = (
 	u16(0x0018), // Depth
 	i16(0xffff), // Pre-defined
 ], [
-	VIDEO_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec](trackData),
+	VIDEO_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec]?.(trackData) ?? null,
 	pasp(trackData),
 	colorSpaceIsComplete(trackData.info.decoderConfig.colorSpace) ? colr(trackData) : null,
 ]);
@@ -1781,16 +1781,21 @@ const videoCodecToBoxName = (codec: VideoCodec, fullCodecString: string) => {
 		case 'vp9': return 'vp09';
 		case 'av1': return 'av01';
 		case 'vvc': return 'vvc1';
+		case 'prores': return fullCodecString;
 	}
 };
 
-const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<VideoCodec, (trackData: IsobmffVideoTrackData) => Box | null> = {
+const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
+	VideoCodec,
+	((trackData: IsobmffVideoTrackData) => Box | null) | null
+> = {
 	avc: avcC,
 	hevc: hvcC,
 	vp8: vpcC,
 	vp9: vpcC,
 	av1: av1C,
 	vvc: () => null, // TODO: implement vvcC box writer when VVC muxing support is added
+	prores: null,
 };
 
 const audioCodecToBoxName = (codec: AudioCodec, isQuickTime: boolean): string => {

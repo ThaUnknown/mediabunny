@@ -9,14 +9,18 @@
 import { TrackType } from '../output';
 import {
 	extractAv1CodecInfoFromPacket,
+	extractDtsFourCcFromPacket,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
+	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
 } from '../codec-data';
 import {
 	AacCodecInfo,
 	AudioCodec,
+	DtsFourCc,
 	extractAudioCodecString,
+	extractColorSpace,
 	extractVideoCodecString,
 	MediaCodec,
 	OPUS_SAMPLE_RATE,
@@ -38,13 +42,21 @@ import {
 	assert,
 	binarySearchLessOrEqual,
 	COLOR_PRIMARIES_MAP_INVERSE,
+	colorSpaceIsComplete,
+	EMPTY_COLOR_SPACE,
 	findLastIndex,
 	isIso639Dash2LanguageCode,
+	isThenable,
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
+	centeredTransformationMatrix,
+	DEG_TO_RAD,
+	multiplyMatrices,
 	normalizeRotation,
 	Rotation,
+	rotationMatrix,
 	roundIfAlmostInteger,
+	scaleMatrix,
 	textDecoder,
 	toDataView,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
@@ -214,10 +226,12 @@ type InternalTrack = {
 			displayUnit: number | null;
 			squarePixelWidth: number;
 			squarePixelHeight: number;
+			horizontalScale: number;
+			verticalScale: number;
 			rotation: Rotation;
 			codec: VideoCodec | null;
 			codecDescription: Uint8Array | null;
-			colorSpace: VideoColorSpaceInit | null;
+			colorSpace: VideoColorSpaceInit;
 			alphaMode: boolean;
 			proresFormat: ProresFourCc | null;
 		}
@@ -229,6 +243,7 @@ type InternalTrack = {
 			codec: AudioCodec | null;
 			codecDescription: Uint8Array | null;
 			aacCodecInfo: AacCodecInfo | null;
+			dtsFormat: DtsFourCc | null;
 		};
 };
 type InternalVideoTrack = InternalTrack & { info: { type: 'video' } };
@@ -331,7 +346,7 @@ export class MatroskaDemuxer extends Demuxer {
 			// Loop over all top-level elements in the file
 			while (true) {
 				let slice = this.reader.requestSliceRange(currentPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
-				if (slice instanceof Promise) slice = await slice;
+				if (isThenable(slice)) slice = await slice;
 				if (!slice) break;
 
 				const header = readElementHeader(slice);
@@ -347,7 +362,7 @@ export class MatroskaDemuxer extends Demuxer {
 					assertDefinedSize(size);
 
 					let slice = this.reader.requestSlice(dataStartPos, size);
-					if (slice instanceof Promise) slice = await slice;
+					if (isThenable(slice)) slice = await slice;
 					if (!slice) break;
 
 					this.readContiguousElements(slice);
@@ -427,10 +442,11 @@ export class MatroskaDemuxer extends Demuxer {
 		this.segments.push(this.currentSegment);
 
 		let currentPos = segmentDataStart;
+		const visitedSeekHeadPositions = new Set<number>();
 
 		while (this.currentSegment.elementEndPos === null || currentPos < this.currentSegment.elementEndPos) {
 			let slice = this.reader.requestSliceRange(currentPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			if (!slice) break;
 
 			const elementStartPos = currentPos;
@@ -462,10 +478,14 @@ export class MatroskaDemuxer extends Demuxer {
 				const field = METADATA_ELEMENTS[metadataElementIndex]!.flag;
 				this.currentSegment[field] = true;
 
+				if (id === EBMLId.SeekHead) {
+					visitedSeekHeadPositions.add(elementStartPos - segmentDataStart);
+				}
+
 				assertDefinedSize(size);
 
 				let slice = this.reader.requestSlice(dataStartPos, size);
-				if (slice instanceof Promise) slice = await slice;
+				if (isThenable(slice)) slice = await slice;
 
 				if (slice) {
 					this.readContiguousElements(slice);
@@ -481,7 +501,7 @@ export class MatroskaDemuxer extends Demuxer {
 				assertDefinedSize(size);
 
 				let slice = this.reader.requestSlice(dataStartPos, size);
-				if (slice instanceof Promise) slice = await slice;
+				if (isThenable(slice)) slice = await slice;
 
 				if (slice) {
 					this.readContiguousElements(slice);
@@ -495,6 +515,41 @@ export class MatroskaDemuxer extends Demuxer {
 				break;
 			} else {
 				currentPos = dataStartPos + size;
+			}
+		}
+
+		if (this.reader.fileSize !== null) {
+			// Seek heads can sometimes point to other seek heads, so follow them until there are no unvisited
+			// ones left.
+			while (true) {
+				const seekEntry = this.currentSegment.seekEntries.find(x =>
+					x.id === EBMLId.SeekHead && !visitedSeekHeadPositions.has(x.segmentPosition),
+				);
+				if (!seekEntry) {
+					break;
+				}
+
+				visitedSeekHeadPositions.add(seekEntry.segmentPosition);
+
+				let slice = this.reader.requestSliceRange(
+					segmentDataStart + seekEntry.segmentPosition,
+					MIN_HEADER_SIZE,
+					MAX_HEADER_SIZE,
+				);
+				if (isThenable(slice)) slice = await slice;
+				if (!slice) continue;
+
+				const header = readElementHeader(slice);
+				if (!header || header.id !== EBMLId.SeekHead) continue;
+
+				const { size } = header;
+				assertDefinedSize(size);
+
+				let dataSlice = this.reader.requestSlice(slice.filePos, size);
+				if (isThenable(dataSlice)) dataSlice = await dataSlice;
+				if (!dataSlice) continue;
+
+				this.readContiguousElements(dataSlice);
 			}
 		}
 
@@ -516,7 +571,7 @@ export class MatroskaDemuxer extends Demuxer {
 					MIN_HEADER_SIZE,
 					MAX_HEADER_SIZE,
 				);
-				if (slice instanceof Promise) slice = await slice;
+				if (isThenable(slice)) slice = await slice;
 				if (!slice) continue;
 
 				const header = readElementHeader(slice);
@@ -530,7 +585,7 @@ export class MatroskaDemuxer extends Demuxer {
 				this.currentSegment[target.flag] = true;
 
 				let dataSlice = this.reader.requestSlice(slice.filePos, size);
-				if (dataSlice instanceof Promise) dataSlice = await dataSlice;
+				if (isThenable(dataSlice)) dataSlice = await dataSlice;
 				if (!dataSlice) continue;
 
 				this.readContiguousElements(dataSlice);
@@ -605,7 +660,7 @@ export class MatroskaDemuxer extends Demuxer {
 		}
 
 		let headerSlice = this.reader.requestSliceRange(startPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
-		if (headerSlice instanceof Promise) headerSlice = await headerSlice;
+		if (isThenable(headerSlice)) headerSlice = await headerSlice;
 		assert(headerSlice);
 
 		const elementStartPos = startPos;
@@ -634,7 +689,7 @@ export class MatroskaDemuxer extends Demuxer {
 
 		// Load the entire cluster
 		let dataSlice = this.reader.requestSlice(dataStartPos, size);
-		if (dataSlice instanceof Promise) dataSlice = await dataSlice;
+		if (isThenable(dataSlice)) dataSlice = await dataSlice;
 
 		const cluster: Cluster = {
 			segment,
@@ -891,7 +946,7 @@ export class MatroskaDemuxer extends Demuxer {
 				MIN_HEADER_SIZE,
 				MAX_HEADER_SIZE,
 			);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			if (!slice) continue;
 
 			const header = readElementHeader(slice);
@@ -904,7 +959,7 @@ export class MatroskaDemuxer extends Demuxer {
 			this.currentSegment = segment;
 
 			let dataSlice = this.reader.requestSlice(slice.filePos, size);
-			if (dataSlice instanceof Promise) dataSlice = await dataSlice;
+			if (isThenable(dataSlice)) dataSlice = await dataSlice;
 			if (dataSlice) {
 				this.readContiguousElements(dataSlice);
 			}
@@ -1133,6 +1188,12 @@ export class MatroskaDemuxer extends Demuxer {
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.dts) {
 							this.currentTrack.info.codec = 'dts';
 							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
+
+							if (this.currentTrack.codecId === 'A_DTS/EXPRESS') {
+								this.currentTrack.info.dtsFormat = 'dtse';
+							} else if (this.currentTrack.codecId === 'A_DTS/LOSSLESS') {
+								this.currentTrack.info.dtsFormat = 'dtsl';
+							}
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.truehd) {
 							this.currentTrack.info.codec = 'truehd';
 							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
@@ -1196,10 +1257,12 @@ export class MatroskaDemuxer extends Demuxer {
 						displayUnit: null,
 						squarePixelWidth: -1,
 						squarePixelHeight: -1,
+						horizontalScale: 1,
+						verticalScale: 1,
 						rotation: 0,
 						codec: null,
 						codecDescription: null,
-						colorSpace: null,
+						colorSpace: { ...EMPTY_COLOR_SPACE },
 						alphaMode: false,
 						proresFormat: null,
 					};
@@ -1212,6 +1275,7 @@ export class MatroskaDemuxer extends Demuxer {
 						codec: null,
 						codecDescription: null,
 						aacCodecInfo: null,
+						dtsFormat: null,
 					};
 				}
 			}; break;
@@ -1362,37 +1426,39 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.Colour: {
 				if (this.currentTrack?.info?.type !== 'video') break;
 
-				this.currentTrack.info.colorSpace = {};
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 			}; break;
 
 			case EBMLId.MatrixCoefficients: {
-				if (this.currentTrack?.info?.type !== 'video' || !this.currentTrack.info.colorSpace) break;
+				if (this.currentTrack?.info?.type !== 'video') break;
 
 				const matrixCoefficients = readUnsignedInt(slice, size);
-				const mapped = MATRIX_COEFFICIENTS_MAP_INVERSE[matrixCoefficients] ?? null;
+				const mapped = MATRIX_COEFFICIENTS_MAP_INVERSE[matrixCoefficients];
 				this.currentTrack.info.colorSpace.matrix = mapped as VideoColorSpaceInit['matrix'];
 			}; break;
 
 			case EBMLId.Range: {
-				if (this.currentTrack?.info?.type !== 'video' || !this.currentTrack.info.colorSpace) break;
+				if (this.currentTrack?.info?.type !== 'video') break;
 
-				this.currentTrack.info.colorSpace.fullRange = readUnsignedInt(slice, size) === 2;
+				const range = readUnsignedInt(slice, size);
+				this.currentTrack.info.colorSpace.fullRange = range === 1 || range === 2
+					? range === 2
+					: undefined;
 			}; break;
 
 			case EBMLId.TransferCharacteristics: {
-				if (this.currentTrack?.info?.type !== 'video' || !this.currentTrack.info.colorSpace) break;
+				if (this.currentTrack?.info?.type !== 'video') break;
 
 				const transferCharacteristics = readUnsignedInt(slice, size);
-				const mapped = TRANSFER_CHARACTERISTICS_MAP_INVERSE[transferCharacteristics] ?? null;
+				const mapped = TRANSFER_CHARACTERISTICS_MAP_INVERSE[transferCharacteristics];
 				this.currentTrack.info.colorSpace.transfer = mapped as VideoColorSpaceInit['transfer'];
 			}; break;
 
 			case EBMLId.Primaries: {
-				if (this.currentTrack?.info?.type !== 'video' || !this.currentTrack.info.colorSpace) break;
+				if (this.currentTrack?.info?.type !== 'video') break;
 
 				const primaries = readUnsignedInt(slice, size);
-				const mapped = COLOR_PRIMARIES_MAP_INVERSE[primaries] ?? null;
+				const mapped = COLOR_PRIMARIES_MAP_INVERSE[primaries];
 				this.currentTrack.info.colorSpace.primaries = mapped as VideoColorSpaceInit['primaries'];
 			}; break;
 
@@ -1400,6 +1466,34 @@ export class MatroskaDemuxer extends Demuxer {
 				if (this.currentTrack?.info?.type !== 'video') break;
 
 				this.readContiguousElements(slice.slice(dataStartPos, size));
+			}; break;
+
+			// Yaw and pitch rotate the frame in 3D space about the vertical and horizontal axis respectively. When
+			// snapped to multiples of 90 degrees, that amounts to scaling each axis by the cosine, which models flips.
+			case EBMLId.ProjectionPoseYaw: {
+				if (this.currentTrack?.info?.type !== 'video') break;
+
+				const yaw = readFloat(slice, size);
+
+				try {
+					const normalized = normalizeRotation(yaw);
+					this.currentTrack.info.horizontalScale = Math.round(Math.cos(normalized * DEG_TO_RAD));
+				} catch {
+					// It wasn't a valid rotation
+				}
+			}; break;
+
+			case EBMLId.ProjectionPosePitch: {
+				if (this.currentTrack?.info?.type !== 'video') break;
+
+				const pitch = readFloat(slice, size);
+
+				try {
+					const normalized = normalizeRotation(pitch);
+					this.currentTrack.info.verticalScale = Math.round(Math.cos(normalized * DEG_TO_RAD));
+				} catch {
+					// It wasn't a valid rotation
+				}
 			}; break;
 
 			case EBMLId.ProjectionPoseRoll: {
@@ -1882,6 +1976,13 @@ export class MatroskaDemuxer extends Demuxer {
 					metadataTags.genre ??= value;
 				}; break;
 
+				case 'bpm': {
+					const bpm = Number.parseInt(value, 10);
+					if (Number.isInteger(bpm) && bpm > 0) {
+						metadataTags.beatsPerMinute ??= bpm;
+					}
+				}; break;
+
 				case 'comment': {
 					metadataTags.comment ??= value;
 				}; break;
@@ -1926,6 +2027,16 @@ export class MatroskaDemuxer extends Demuxer {
 				}; break;
 			}
 		}
+	}
+
+	getDurationFromMetadata(segment: Segment) {
+		if (segment.duration <= 0) {
+			return null;
+		}
+
+		// We treat the Duration field as the end timestamp of the segment, since this is what FFmpeg treats it as.
+		// The spec unfortunately does not clarify what it means by duration here.
+		return segment.duration / segment.timestampFactor;
 	}
 }
 
@@ -2009,17 +2120,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 	}
 
 	async getDurationFromMetadata() {
-		const segment = this.internalTrack.segment;
-		if (segment.duration <= 0) {
-			return null;
-		}
-
-		let endTimestamp = segment.duration / segment.timestampFactor;
-
-		const firstPacket = await this.getFirstPacket({ metadataOnly: true });
-		endTimestamp += firstPacket?.timestamp ?? 0;
-
-		return endTimestamp;
+		return this.internalTrack.demuxer.getDurationFromMetadata(this.internalTrack.segment);
 	}
 
 	async getLiveRefreshInterval() {
@@ -2347,7 +2448,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 
 			// Load the header
 			let slice = demuxer.reader.requestSliceRange(currentPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			if (!slice) break;
 
 			const elementStartPos = currentPos;
@@ -2418,7 +2519,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				// the first segment.
 
 				let slice = demuxer.reader.requestSliceRange(endPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
-				if (slice instanceof Promise) slice = await slice;
+				if (isThenable(slice)) slice = await slice;
 				if (!slice) break;
 
 				const elementId = readElementId(slice);
@@ -2452,12 +2553,11 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 }
 
 class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVideoTrackBacking {
-	override internalTrack: InternalVideoTrack;
+	declare internalTrack: InternalVideoTrack;
 	decoderConfigPromise: Promise<VideoDecoderConfig> | null = null;
 
 	constructor(internalTrack: InternalVideoTrack) {
 		super(internalTrack);
-		this.internalTrack = internalTrack;
 	}
 
 	getType() {
@@ -2484,16 +2584,29 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 		return this.internalTrack.info.squarePixelHeight;
 	}
 
-	getRotation() {
-		return this.internalTrack.info.rotation;
+	getTransformationMatrix() {
+		const info = this.internalTrack.info;
+
+		// Yaw and pitch are applied before roll
+		const linear = multiplyMatrices(
+			scaleMatrix(info.horizontalScale, info.verticalScale),
+			rotationMatrix(info.rotation),
+		);
+
+		return centeredTransformationMatrix(linear, info.width, info.height);
 	}
 
 	async getColorSpace(): Promise<VideoColorSpaceInit> {
+		const decoderConfig = await this.getDecoderConfig();
+		if (!decoderConfig) {
+			return this.internalTrack.info.colorSpace;
+		}
+
 		return {
-			primaries: this.internalTrack.info.colorSpace?.primaries,
-			transfer: this.internalTrack.info.colorSpace?.transfer,
-			matrix: this.internalTrack.info.colorSpace?.matrix,
-			fullRange: this.internalTrack.info.colorSpace?.fullRange,
+			primaries: decoderConfig.colorSpace?.primaries,
+			transfer: decoderConfig.colorSpace?.transfer,
+			matrix: decoderConfig.colorSpace?.matrix,
+			fullRange: decoderConfig.colorSpace?.fullRange,
 		};
 	}
 
@@ -2516,6 +2629,7 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 			const needsPacketForAdditionalInfo
 				= this.internalTrack.info.codec === 'vp9'
 					|| this.internalTrack.info.codec === 'av1'
+					|| this.internalTrack.info.codec === 'prores'
 					// Packets are in Annex B format:
 					|| (this.internalTrack.info.codec === 'avc' && !this.internalTrack.info.codecDescription)
 					// Packets are in Annex B format:
@@ -2525,32 +2639,47 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				firstPacket = await this.getFirstPacket({});
 			}
 
+			const codecInfo = {
+				width: this.internalTrack.info.width,
+				height: this.internalTrack.info.height,
+				codec: this.internalTrack.info.codec,
+				codecDescription: this.internalTrack.info.codecDescription,
+				colorSpace: this.internalTrack.info.colorSpace,
+				avcType: 1 as const, // We don't know better (or do we?) so just assume 'avc1'
+				avcCodecInfo: this.internalTrack.info.codec === 'avc' && firstPacket
+					? extractAvcDecoderConfigurationRecord(firstPacket.data)
+					: null,
+				hevcCodecInfo: this.internalTrack.info.codec === 'hevc' && firstPacket
+					? extractHevcDecoderConfigurationRecord(firstPacket.data)
+					: null,
+				vp9CodecInfo: this.internalTrack.info.codec === 'vp9' && firstPacket
+					? extractVp9CodecInfoFromPacket(firstPacket.data)
+					: null,
+				av1CodecInfo: this.internalTrack.info.codec === 'av1' && firstPacket
+					? extractAv1CodecInfoFromPacket(firstPacket.data)
+					: null,
+				proresCodecInfo: this.internalTrack.info.codec === 'prores' && firstPacket
+					? extractProresCodecInfoFromPacket(firstPacket.data)
+					: null,
+				proresFormat: this.internalTrack.info.proresFormat,
+			};
+
+			if (!colorSpaceIsComplete(this.internalTrack.info.colorSpace)) {
+				const colorSpace = extractColorSpace(codecInfo);
+
+				// Fill the missing values
+				this.internalTrack.info.colorSpace.primaries ??= colorSpace.primaries;
+				this.internalTrack.info.colorSpace.transfer ??= colorSpace.transfer;
+				this.internalTrack.info.colorSpace.matrix ??= colorSpace.matrix;
+				this.internalTrack.info.colorSpace.fullRange ??= colorSpace.fullRange;
+			}
+
 			const config: VideoDecoderConfig = {
-				codec: extractVideoCodecString({
-					width: this.internalTrack.info.width,
-					height: this.internalTrack.info.height,
-					codec: this.internalTrack.info.codec,
-					codecDescription: this.internalTrack.info.codecDescription,
-					colorSpace: this.internalTrack.info.colorSpace,
-					avcType: 1, // We don't know better (or do we?) so just assume 'avc1'
-					avcCodecInfo: this.internalTrack.info.codec === 'avc' && firstPacket
-						? extractAvcDecoderConfigurationRecord(firstPacket.data)
-						: null,
-					hevcCodecInfo: this.internalTrack.info.codec === 'hevc' && firstPacket
-						? extractHevcDecoderConfigurationRecord(firstPacket.data)
-						: null,
-					vp9CodecInfo: this.internalTrack.info.codec === 'vp9' && firstPacket
-						? extractVp9CodecInfoFromPacket(firstPacket.data)
-						: null,
-					av1CodecInfo: this.internalTrack.info.codec === 'av1' && firstPacket
-						? extractAv1CodecInfoFromPacket(firstPacket.data)
-						: null,
-					proresFormat: this.internalTrack.info.proresFormat,
-				}),
+				codec: extractVideoCodecString(codecInfo),
 				codedWidth: this.internalTrack.info.width,
 				codedHeight: this.internalTrack.info.height,
 				description: this.internalTrack.info.codecDescription ?? undefined,
-				colorSpace: this.internalTrack.info.colorSpace ?? undefined,
+				colorSpace: this.internalTrack.info.colorSpace,
 			};
 
 			if (
@@ -2567,12 +2696,11 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 }
 
 class MatroskaAudioTrackBacking extends MatroskaTrackBacking implements InputAudioTrackBacking {
-	override internalTrack: InternalAudioTrack;
-	decoderConfig: AudioDecoderConfig | null = null;
+	declare internalTrack: InternalAudioTrack;
+	decoderConfigPromise: Promise<AudioDecoderConfig> | null = null;
 
 	constructor(internalTrack: InternalAudioTrack) {
 		super(internalTrack);
-		this.internalTrack = internalTrack;
 	}
 
 	getType() {
@@ -2596,15 +2724,24 @@ class MatroskaAudioTrackBacking extends MatroskaTrackBacking implements InputAud
 			return null;
 		}
 
-		return this.decoderConfig ??= {
-			codec: extractAudioCodecString({
-				codec: this.internalTrack.info.codec,
-				codecDescription: this.internalTrack.info.codecDescription,
-				aacCodecInfo: this.internalTrack.info.aacCodecInfo,
-			}),
-			numberOfChannels: this.internalTrack.info.numberOfChannels,
-			sampleRate: this.internalTrack.info.sampleRate,
-			description: this.internalTrack.info.codecDescription ?? undefined,
-		};
+		return this.decoderConfigPromise ??= (async (): Promise<AudioDecoderConfig> => {
+			if (this.internalTrack.info.codec === 'dts' && !this.internalTrack.info.dtsFormat) {
+				// Gotta check the packet to determine the DTS variant
+				const firstPacket = await this.getFirstPacket({});
+				this.internalTrack.info.dtsFormat = firstPacket && extractDtsFourCcFromPacket(firstPacket.data);
+			}
+
+			return {
+				codec: extractAudioCodecString({
+					codec: this.internalTrack.info.codec,
+					codecDescription: this.internalTrack.info.codecDescription,
+					aacCodecInfo: this.internalTrack.info.aacCodecInfo,
+					dtsFormat: this.internalTrack.info.dtsFormat,
+				}),
+				numberOfChannels: this.internalTrack.info.numberOfChannels,
+				sampleRate: this.internalTrack.info.sampleRate,
+				description: this.internalTrack.info.codecDescription ?? undefined,
+			};
+		})();
 	}
 }

@@ -115,17 +115,22 @@ const sponsors = {
 		{ image: 'https://avatars.githubusercontent.com/u/189556080', name: 'Cursorful', url: 'https://github.com/cursorful' },
 		{ image: 'https://avatars.githubusercontent.com/u/11537072', name: 'Threema', url: 'https://threema.com/en' },
 		{ image: 'https://avatars.githubusercontent.com/u/82552321', name: 'Polotno', url: 'https://github.com/polotno-project' },
+		{ image: 'https://avatars.githubusercontent.com/u/136796770', name: 'jj', url: 'https://github.com/dumbmoron' },
 		{ image: 'https://avatars.githubusercontent.com/u/489051', name: 'Roman Rädle', url: 'https://github.com/raedle' },
 		{ image: 'https://avatars.githubusercontent.com/u/197597', name: 'Christopher Chedeau', url: 'https://github.com/vjeux' },
 		{ image: 'https://avatars.githubusercontent.com/u/18653821', name: 'ZerGo0', url: 'https://github.com/ZerGo0' },
+		{ image: 'https://avatars.githubusercontent.com/u/155910618', name: 'Noice Tech', url: 'https://github.com/noice-tech' },
+		{ image: 'https://avatars.githubusercontent.com/u/20625636', name: 'johnpyp', url: 'https://github.com/johnpyp' },
 		{ image: 'https://avatars.githubusercontent.com/u/5913254', name: 'Brandon McConnell', url: 'https://github.com/brandonmcconnell' },
 		{ image: 'https://avatars.githubusercontent.com/u/9549394', name: 'studnitz', url: 'https://github.com/studnitz' },
 		{ image: 'https://avatars.githubusercontent.com/u/67356781', name: 'Ahmed Rowaihi', url: 'https://github.com/ahmedrowaihi' },
 		{ image: 'https://avatars.githubusercontent.com/u/4714175', name: 'Phoomparin Mano', url: 'https://github.com/heypoom' },
 		{ image: 'https://avatars.githubusercontent.com/u/504909', name: 'Hirbod', url: 'https://github.com/hirbod' },
+		{ image: 'https://avatars.githubusercontent.com/u/15199031', name: 'Marc Rousavy', url: 'https://github.com/mrousavy' },
 		{ image: 'https://avatars.githubusercontent.com/u/2565549', name: 'MatthewNorton', url: 'https://github.com/MatthewNorton' },
 		{ image: 'https://avatars.githubusercontent.com/u/272247752', name: 'Motionik', url: 'https://github.com/Motionik' },
 		{ image: 'https://avatars.githubusercontent.com/u/2698271', name: 'Matthew Gardner', url: 'https://github.com/spheric' },
+		{ image: 'https://avatars.githubusercontent.com/u/41021374', name: 'arth', url: 'https://github.com/arthtyagi' },
 		{ image: 'https://avatars.githubusercontent.com/u/5475819', name: 'AJ Funk', url: 'https://github.com/AJFunk' },
 		{ image: 'https://avatars.githubusercontent.com/u/30229596', name: 'Pablo Bonilla', url: 'https://github.com/devPablo' },
 		{ image: 'https://avatars.githubusercontent.com/u/536008', name: 'Satish Goda', url: 'https://github.com/satishgoda' },
@@ -136,9 +141,11 @@ const sponsors = {
 		{ image: 'https://avatars.githubusercontent.com/u/255616819', name: 'cronischarles-del', url: 'https://github.com/cronischarles-del' },
 		{ image: 'https://avatars.githubusercontent.com/u/37973863', name: 'Gomi', url: 'https://github.com/gxy5202' },
 		{ image: 'https://avatars.githubusercontent.com/u/36898190', name: 'jepcd', url: 'https://github.com/jepcd' },
+		{ image: 'https://avatars.githubusercontent.com/u/3372909', name: 'Vlad', url: 'https://github.com/deifos' },
 		{ image: 'https://avatars.githubusercontent.com/u/695166', name: 'Takenori Nakagawa', url: 'https://github.com/ww24' },
 		{ image: 'https://avatars.githubusercontent.com/u/63088713', name: 'taf2000', url: 'https://github.com/taf2000' },
 		{ image: 'https://avatars.githubusercontent.com/u/58149663', name: 'H7GhosT', url: 'https://github.com/H7GhosT' },
+		{ image: 'https://avatars.githubusercontent.com/u/20795292', name: 'Max Perrello', url: 'https://github.com/maxtheaxe' },
 		{ image: 'https://avatars.githubusercontent.com/u/91711202', name: 'ihasq', url: 'https://github.com/ihasq' },
 		{ image: 'https://avatars.githubusercontent.com/u/61233224', name: 'Allwhy', url: 'https://github.com/Allwhy' },
 		{ image: 'https://avatars.githubusercontent.com/u/97225946', name: '808vita', url: 'https://github.com/808vita' },
@@ -233,14 +240,14 @@ const output = new Output({
 // Add video, driven by a canvas
 const videoSource = new CanvasSource(canvas, {
 	codec: 'av1',
-	bitrate: QUALITY_HIGH,
+	quality: new Quality('high'),
 });
 output.addVideoTrack(videoSource);
 
 // Add audio, driven by audio buffers
 const audioSource = new AudioBufferSource({
 	codec: 'opus',
-	bitrate: QUALITY_HIGH,
+	quality: new Quality('high'),
 });
 output.addAudioTrack(audioSource);
 

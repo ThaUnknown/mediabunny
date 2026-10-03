@@ -11,7 +11,10 @@ import { parseAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
 	AacCodecInfo,
 	AudioCodec,
+	DTS_FOURCCS,
+	DtsFourCc,
 	extractAudioCodecString,
+	extractColorSpace,
 	extractVideoCodecString,
 	MediaCodec,
 	OPUS_SAMPLE_RATE,
@@ -24,16 +27,30 @@ import {
 } from '../codec';
 import {
 	Av1CodecInfo,
+	av1CodecInfoHasColorInfo,
 	AvcDecoderConfigurationRecord,
 	extractAv1CodecInfoFromPacket,
+	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
 	FlacBlockType,
 	HevcDecoderConfigurationRecord,
+	ProresCodecInfo,
 	Vp9CodecInfo,
+	vp9CodecInfoHasColorInfo,
 	parseEac3Config,
 	getEac3SampleRate,
 	getEac3ChannelCount,
+	extractDtsFourCcFromPacket,
+	parseDtsSpecificBox,
+	DTS_SPECIFIC_BOX_SIZE,
 	AC3_ACMOD_CHANNEL_COUNTS,
+	extractAvcDecoderConfigurationRecord,
+	extractHevcDecoderConfigurationRecord,
+	deserializeAvcDecoderConfigurationRecord,
+	deserializeHevcDecoderConfigurationRecord,
+	HevcNalUnitType,
+	parseAvcSps,
+	parseHevcSps,
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
@@ -50,12 +67,13 @@ import {
 	bytesToHexString,
 	COLOR_PRIMARIES_MAP_INVERSE,
 	findLastIndex,
+	IDENTITY_MATRIX,
 	isIso639Dash2LanguageCode,
+	isThenable,
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
-	normalizeRotation,
-	roundToMultiple,
-	Rotation,
+	multiplyMatrices,
+	Rational,
 	textDecoder,
 	TransformationMatrix,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
@@ -64,6 +82,8 @@ import {
 	roundIfAlmostInteger,
 	hexStringToBytes,
 	HEX_STRING_REGEX,
+	EMPTY_COLOR_SPACE,
+	colorSpaceIsComplete,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { buildIsobmffMimeType, parsePsshBoxContents, psshBoxesAreEqual, PsshBox } from './isobmff-misc';
@@ -106,7 +126,7 @@ type InternalTrack = {
 	timescale: number;
 	durationInMovieTimescale: number;
 	durationInMediaTimescale: number;
-	rotation: Rotation;
+	matrix: TransformationMatrix;
 	internalCodecId: string | null;
 	name: string | null;
 	languageCode: string;
@@ -132,6 +152,9 @@ type InternalTrack = {
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
+	/** In bits per second, from the btrt box if present. */
+	maxBitrate: number | null;
+	avgBitrate: number | null;
 } & ({
 	info: null;
 } | {
@@ -143,12 +166,13 @@ type InternalTrack = {
 		squarePixelHeight: number;
 		codec: VideoCodec | null;
 		codecDescription: Uint8Array | null;
-		colorSpace: VideoColorSpaceInit | null;
+		colorSpace: VideoColorSpaceInit;
 		avcType: 1 | 3 | null;
 		avcCodecInfo: AvcDecoderConfigurationRecord | null;
 		hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 		vp9CodecInfo: Vp9CodecInfo | null;
 		av1CodecInfo: Av1CodecInfo | null;
+		proresCodecInfo: ProresCodecInfo | null;
 		proresFormat: ProresFourCc | null;
 	};
 } | {
@@ -159,6 +183,7 @@ type InternalTrack = {
 		codec: AudioCodec | null;
 		codecDescription: Uint8Array | null;
 		aacCodecInfo: AacCodecInfo | null;
+		dtsFormat: DtsFourCc | null;
 		pcmLittleEndian: boolean;
 		pcmSampleSize: number | null;
 	};
@@ -300,6 +325,7 @@ export class IsobmffDemuxer extends Demuxer {
 	metadataPromise: Promise<void> | null = null;
 	movieTimescale = -1;
 	movieDurationInTimescale = -1;
+	movieMatrix = IDENTITY_MATRIX;
 	isQuickTime = false;
 	metadataTags: MetadataTags = {};
 	currentMetadataKeys: Map<number, string> | null = null;
@@ -352,10 +378,11 @@ export class IsobmffDemuxer extends Demuxer {
 		return this.metadataPromise ??= (async () => {
 			let currentPos = 0;
 			let lookForMfraBox = false;
+			let foundMovieBoxes = false;
 
 			while (true) {
 				let slice = this.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
-				if (slice instanceof Promise) slice = await slice;
+				if (isThenable(slice)) slice = await slice;
 				if (!slice) break;
 
 				const startPos = currentPos;
@@ -371,7 +398,7 @@ export class IsobmffDemuxer extends Demuxer {
 					// Found moov, load it
 
 					let moovSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
-					if (moovSlice instanceof Promise) moovSlice = await moovSlice;
+					if (isThenable(moovSlice)) moovSlice = await moovSlice;
 					if (!moovSlice) break;
 
 					this.moovSlice = moovSlice;
@@ -388,6 +415,7 @@ export class IsobmffDemuxer extends Demuxer {
 					lookForMfraBox = this.isFragmented
 						&& this.reader.fileSize !== null
 						&& this.reader.fileSize > startPos + boxInfo.totalSize; // There's more after the moov box
+					foundMovieBoxes = true;
 
 					break;
 				} else if (boxInfo.name === 'moof') {
@@ -399,65 +427,10 @@ export class IsobmffDemuxer extends Demuxer {
 						);
 					}
 
-					const initDemuxer = (await this.input._initInput._getDemuxer()) as IsobmffDemuxer;
-					if (initDemuxer.constructor !== IsobmffDemuxer) {
-						throw new Error('Init input must match the input\'s format.');
-					}
-
-					await initDemuxer.readMetadata();
-
-					this.movieTimescale = initDemuxer.movieTimescale;
-					this.movieDurationInTimescale = initDemuxer.movieDurationInTimescale;
-					this.metadataTags = initDemuxer.metadataTags;
-					this.isFragmented = true;
-					this.fragmentTrackDefaults = initDemuxer.fragmentTrackDefaults;
-					this.psshBoxes = initDemuxer.psshBoxes;
-
-					// Create tracks from the init input's tracks
-					for (const foreignTrack of initDemuxer.tracks) {
-						const track: InternalTrack = {
-							id: foreignTrack.id,
-							demuxer: this,
-							trackBacking: null,
-							disposition: foreignTrack.disposition,
-							timescale: foreignTrack.timescale,
-							durationInMediaTimescale: foreignTrack.durationInMediaTimescale,
-							durationInMovieTimescale: foreignTrack.durationInMovieTimescale,
-							rotation: foreignTrack.rotation,
-							internalCodecId: foreignTrack.internalCodecId,
-							name: foreignTrack.name,
-							languageCode: foreignTrack.languageCode,
-							sampleTableByteOffset: null,
-							sampleTable: null,
-							fragmentLookupTable: [],
-							currentFragmentState: null,
-							fragmentPositionCache: [],
-							editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
-							editListOffset: foreignTrack.editListOffset,
-							encryptionInfo: foreignTrack.encryptionInfo,
-							encryptionAuxInfo: null,
-							frmaCodecString: null,
-							info: foreignTrack.info,
-						};
-
-						if (foreignTrack.trackBacking) {
-							assert(track.info);
-
-							if (track.info.type === 'video' && track.info.width !== -1) {
-								const videoTrack = track as InternalVideoTrack;
-								track.trackBacking = new IsobmffVideoTrackBacking(videoTrack);
-								this.tracks.push(track);
-							} else if (track.info.type === 'audio' && track.info.numberOfChannels !== -1) {
-								const audioTrack = track as InternalAudioTrack;
-								track.trackBacking = new IsobmffAudioTrackBacking(audioTrack);
-								this.tracks.push(track);
-							}
-						} else {
-							// The track didn't have enough info to warrant a backing
-						}
-					}
+					await this.copyMetadataFromInitInput(this.input._initInput);
 
 					lookForMfraBox = false; // No point in doing it for segment files
+					foundMovieBoxes = true;
 
 					break;
 				}
@@ -465,12 +438,18 @@ export class IsobmffDemuxer extends Demuxer {
 				currentPos = startPos + boxInfo.totalSize;
 			}
 
+			if (!foundMovieBoxes && this.input._initInput) {
+				// A segment file is allowed to hold zero fragments, in which case there's no moof box to key off of.
+				// It's still a perfectly valid segment, so let's take the tracks from the init input.
+				await this.copyMetadataFromInitInput(this.input._initInput);
+			}
+
 			if (lookForMfraBox) {
 				assert(this.reader.fileSize !== null);
 
 				// The last 4 bytes may contain the size of the mfra box at the end of the file
 				let lastWordSlice = this.reader.requestSlice(this.reader.fileSize - 4, 4);
-				if (lastWordSlice instanceof Promise) lastWordSlice = await lastWordSlice;
+				if (isThenable(lastWordSlice)) lastWordSlice = await lastWordSlice;
 				assert(lastWordSlice);
 
 				const lastWord = readU32Be(lastWordSlice);
@@ -482,7 +461,7 @@ export class IsobmffDemuxer extends Demuxer {
 						MIN_BOX_HEADER_SIZE,
 						MAX_BOX_HEADER_SIZE,
 					);
-					if (mfraHeaderSlice instanceof Promise) mfraHeaderSlice = await mfraHeaderSlice;
+					if (isThenable(mfraHeaderSlice)) mfraHeaderSlice = await mfraHeaderSlice;
 
 					if (mfraHeaderSlice) {
 						const boxInfo = readBoxHeader(mfraHeaderSlice);
@@ -490,7 +469,7 @@ export class IsobmffDemuxer extends Demuxer {
 						if (boxInfo && boxInfo.name === 'mfra') {
 							// We found the mfra box, allowing for much better random access. Let's parse it.
 							let mfraSlice = this.reader.requestSlice(mfraHeaderSlice.filePos, boxInfo.contentSize);
-							if (mfraSlice instanceof Promise) mfraSlice = await mfraSlice;
+							if (isThenable(mfraSlice)) mfraSlice = await mfraSlice;
 
 							if (mfraSlice) {
 								this.readContiguousBoxes(mfraSlice);
@@ -500,6 +479,69 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 			}
 		})();
+	}
+
+	private async copyMetadataFromInitInput(initInput: Input) {
+		const initDemuxer = (await initInput._getDemuxer()) as IsobmffDemuxer;
+		if (initDemuxer.constructor !== IsobmffDemuxer) {
+			throw new Error('Init input must match the input\'s format.');
+		}
+
+		await initDemuxer.readMetadata();
+
+		this.movieTimescale = initDemuxer.movieTimescale;
+		this.movieDurationInTimescale = initDemuxer.movieDurationInTimescale;
+		this.movieMatrix = initDemuxer.movieMatrix;
+		this.metadataTags = initDemuxer.metadataTags;
+		this.isFragmented = true;
+		this.fragmentTrackDefaults = initDemuxer.fragmentTrackDefaults;
+		this.psshBoxes = initDemuxer.psshBoxes;
+
+		// Create tracks from the init input's tracks
+		for (const foreignTrack of initDemuxer.tracks) {
+			const track: InternalTrack = {
+				id: foreignTrack.id,
+				demuxer: this,
+				trackBacking: null,
+				disposition: foreignTrack.disposition,
+				timescale: foreignTrack.timescale,
+				durationInMediaTimescale: foreignTrack.durationInMediaTimescale,
+				durationInMovieTimescale: foreignTrack.durationInMovieTimescale,
+				matrix: foreignTrack.matrix,
+				internalCodecId: foreignTrack.internalCodecId,
+				name: foreignTrack.name,
+				languageCode: foreignTrack.languageCode,
+				sampleTableByteOffset: null,
+				sampleTable: null,
+				fragmentLookupTable: [],
+				currentFragmentState: null,
+				fragmentPositionCache: [],
+				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
+				editListOffset: foreignTrack.editListOffset,
+				encryptionInfo: foreignTrack.encryptionInfo,
+				encryptionAuxInfo: null,
+				frmaCodecString: null,
+				maxBitrate: foreignTrack.maxBitrate,
+				avgBitrate: foreignTrack.avgBitrate,
+				info: foreignTrack.info,
+			};
+
+			if (foreignTrack.trackBacking) {
+				assert(track.info);
+
+				if (track.info.type === 'video' && track.info.width !== -1) {
+					const videoTrack = track as InternalVideoTrack;
+					track.trackBacking = new IsobmffVideoTrackBacking(videoTrack);
+					this.tracks.push(track);
+				} else if (track.info.type === 'audio' && track.info.numberOfChannels !== -1) {
+					const audioTrack = track as InternalAudioTrack;
+					track.trackBacking = new IsobmffAudioTrackBacking(audioTrack);
+					this.tracks.push(track);
+				}
+			} else {
+				// The track didn't have enough info to warrant a backing
+			}
+		}
 	}
 
 	getSampleTableForTrack(internalTrack: InternalTrack) {
@@ -657,14 +699,14 @@ export class IsobmffDemuxer extends Demuxer {
 		}
 
 		let headerSlice = this.reader.requestSliceRange(startPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
-		if (headerSlice instanceof Promise) headerSlice = await headerSlice;
+		if (isThenable(headerSlice)) headerSlice = await headerSlice;
 		assert(headerSlice);
 
 		const moofBoxInfo = readBoxHeader(headerSlice);
 		assert(moofBoxInfo?.name === 'moof');
 
 		let entireSlice = this.reader.requestSlice(startPos, moofBoxInfo.totalSize);
-		if (entireSlice instanceof Promise) entireSlice = await entireSlice;
+		if (isThenable(entireSlice)) entireSlice = await entireSlice;
 		assert(entireSlice);
 
 		this.traverseBox(entireSlice);
@@ -804,6 +846,9 @@ export class IsobmffDemuxer extends Demuxer {
 					this.movieTimescale = readU32Be(slice);
 					this.movieDurationInTimescale = readU32Be(slice);
 				}
+
+				slice.skip(4 + 2 + 2 + 2 * 4); // Rate, volume, reserved
+				this.movieMatrix = readMatrix(slice);
 			}; break;
 
 			case 'trak': {
@@ -819,7 +864,7 @@ export class IsobmffDemuxer extends Demuxer {
 					timescale: -1,
 					durationInMovieTimescale: -1,
 					durationInMediaTimescale: -1,
-					rotation: 0,
+					matrix: IDENTITY_MATRIX,
 					internalCodecId: null,
 					name: null,
 					languageCode: UNDETERMINED_LANGUAGE,
@@ -833,6 +878,8 @@ export class IsobmffDemuxer extends Demuxer {
 					encryptionInfo: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
+					maxBitrate: null,
+					avgBitrate: null,
 				} satisfies InternalTrack as InternalTrack;
 				this.currentTrack = track;
 
@@ -883,22 +930,10 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				slice.skip(2 * 4 + 2 + 2 + 2 + 2);
-				const matrix: TransformationMatrix = [
-					readFixed_16_16(slice),
-					readFixed_16_16(slice),
-					readFixed_2_30(slice),
-					readFixed_16_16(slice),
-					readFixed_16_16(slice),
-					readFixed_2_30(slice),
-					readFixed_16_16(slice),
-					readFixed_16_16(slice),
-					readFixed_2_30(slice),
-				];
+				const trackMatrix = readMatrix(slice);
 
-				const rotation = normalizeRotation(roundToMultiple(extractRotationFromMatrix(matrix), 90));
-				assert(rotation === 0 || rotation === 90 || rotation === 180 || rotation === 270);
-
-				track.rotation = rotation;
+				// The track matrix maps into movie space, and the movie matrix then maps into the final output space
+				track.matrix = multiplyMatrices(trackMatrix, this.movieMatrix);
 			}; break;
 
 			case 'elst': {
@@ -922,11 +957,6 @@ export class IsobmffDemuxer extends Demuxer {
 						? readI64Be(slice)
 						: readI32Be(slice);
 					const mediaRate = readFixed_16_16(slice);
-
-					if (segmentDuration === 0) {
-						// Don't care
-						continue;
-					}
 
 					if (relevantEntryFound) {
 						Logging._warn(
@@ -1005,12 +1035,13 @@ export class IsobmffDemuxer extends Demuxer {
 						squarePixelHeight: -1,
 						codec: null,
 						codecDescription: null,
-						colorSpace: null,
+						colorSpace: { ...EMPTY_COLOR_SPACE },
 						avcType: null,
 						avcCodecInfo: null,
 						hevcCodecInfo: null,
 						vp9CodecInfo: null,
 						av1CodecInfo: null,
+						proresCodecInfo: null,
 						proresFormat: null,
 					};
 				} else if (handlerType === 'soun') {
@@ -1021,6 +1052,7 @@ export class IsobmffDemuxer extends Demuxer {
 						codec: null,
 						codecDescription: null,
 						aacCodecInfo: null,
+						dtsFormat: null,
 						pcmLittleEndian: false,
 						pcmSampleSize: null,
 					};
@@ -1174,13 +1206,9 @@ export class IsobmffDemuxer extends Demuxer {
 							track.info.codec = 'ac3';
 						} else if (codecName === 'ec-3') {
 							track.info.codec = 'eac3';
-						} else if (
-							codecName === 'dtsc'
-							|| codecName === 'dtsh'
-							|| codecName === 'dtsl'
-							|| codecName === 'dtse'
-						) {
+						} else if ((DTS_FOURCCS as readonly string[]).includes(codecName!)) {
 							track.info.codec = 'dts';
+							track.info.dtsFormat = codecName as DtsFourCc;
 						} else if (codecName === 'mlpa') {
 							track.info.codec = 'truehd';
 						} else if (codecName === 'alac') {
@@ -1380,7 +1408,19 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 				assert(track.info);
 
+				if (boxInfo.contentSize === 0) {
+					// avcC box is empty, let's treat this like an Annex B stream
+					break;
+				}
+
 				track.info.codecDescription = readBytes(slice, boxInfo.contentSize);
+
+				const sps = deserializeAvcDecoderConfigurationRecord(track.info.codecDescription)
+					?.sequenceParameterSets[0];
+				const spsInfo = sps && parseAvcSps(sps);
+				if (spsInfo) {
+					applySpsPixelAspectRatio(track, spsInfo.pixelAspectRatio);
+				}
 			}; break;
 
 			case 'hvcC': {
@@ -1390,7 +1430,19 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 				assert(track.info);
 
+				if (boxInfo.contentSize === 0) {
+					// hvcC box is empty, let's treat this like an Annex B stream
+					break;
+				}
+
 				track.info.codecDescription = readBytes(slice, boxInfo.contentSize);
+
+				const sps = deserializeHevcDecoderConfigurationRecord(track.info.codecDescription)
+					?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
+				const spsInfo = sps && parseHevcSps(sps);
+				if (spsInfo) {
+					applySpsPixelAspectRatio(track, spsInfo.pixelAspectRatio);
+				}
 			}; break;
 
 			case 'vpcC': {
@@ -1449,6 +1501,12 @@ export class IsobmffDemuxer extends Demuxer {
 				// Logic from https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 				const bitDepth = profile === 2 && highBitDepth ? (twelveBit ? 12 : 10) : (highBitDepth ? 10 : 8);
 
+				slice.skip(1); // Reserved bits + initial presentation delay
+
+				// Parse config OBUs if there are any
+				const configObus = readBytes(slice, boxInfo.contentSize - 4);
+				const configObuInfo = extractAv1CodecInfoFromPacket(configObus);
+
 				track.info.av1CodecInfo = {
 					profile,
 					level,
@@ -1458,6 +1516,10 @@ export class IsobmffDemuxer extends Demuxer {
 					chromaSubsamplingX,
 					chromaSubsamplingY,
 					chromaSamplePosition,
+					videoFullRangeFlag: configObuInfo?.videoFullRangeFlag ?? 0,
+					colourPrimaries: configObuInfo?.colourPrimaries ?? 2,
+					transferCharacteristics: configObuInfo?.transferCharacteristics ?? 2,
+					matrixCoefficients: configObuInfo?.matrixCoefficients ?? 2,
 				};
 			}; break;
 
@@ -1502,6 +1564,10 @@ export class IsobmffDemuxer extends Demuxer {
 
 				// https://github.com/Vanilagy/mediabunny/issues/362
 				if (num > 0 && den > 0) {
+					// The ratio may already be set by the SPS, but the pasp box wins
+					track.info.squarePixelWidth = track.info.width;
+					track.info.squarePixelHeight = track.info.height;
+
 					if (num > den) {
 						track.info.squarePixelWidth = Math.round(track.info.width * num / den);
 					} else {
@@ -1510,16 +1576,29 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 			}; break;
 
+			case 'btrt': {
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+
+				slice.skip(4); // Buffer size
+				const maxBitrate = readU32Be(slice);
+				const avgBitrate = readU32Be(slice);
+
+				track.maxBitrate = maxBitrate > 0 ? maxBitrate : null;
+				track.avgBitrate = avgBitrate > 0 ? avgBitrate : null;
+			}; break;
+
 			case 'wave': {
 				this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 			}; break;
 
 			case 'esds': {
 				const track = this.currentTrack;
-				if (!track) {
+				if (!track || track.info?.type !== 'audio') {
 					break;
 				}
-				assert(track.info?.type === 'audio');
 
 				slice.skip(4); // Version + flags
 
@@ -1564,6 +1643,8 @@ export class IsobmffDemuxer extends Demuxer {
 					track.info.codec = 'mp3';
 				} else if (objectTypeIndication === 0xdd) {
 					track.info.codec = 'vorbis'; // "nonstandard, gpac uses it" - FFmpeg
+				} else if (objectTypeIndication === 0xa9) {
+					track.info.codec = 'dts';
 				} else {
 					Logging._warn(
 						`Unsupported audio codec (objectTypeIndication ${objectTypeIndication}) - discarding track.`,
@@ -1584,11 +1665,11 @@ export class IsobmffDemuxer extends Demuxer {
 					if (track.info.codec === 'aac') {
 						// Let's try to deduce more accurate values directly from the AudioSpecificConfig:
 						const audioSpecificConfig = parseAacAudioSpecificConfig(track.info.codecDescription);
-						if (audioSpecificConfig.numberOfChannels !== null) {
-							track.info.numberOfChannels = audioSpecificConfig.numberOfChannels;
+						if (audioSpecificConfig.outputNumberOfChannels !== null) {
+							track.info.numberOfChannels = audioSpecificConfig.outputNumberOfChannels;
 						}
-						if (audioSpecificConfig.sampleRate !== null) {
-							track.info.sampleRate = audioSpecificConfig.sampleRate;
+						if (audioSpecificConfig.outputSampleRate !== null) {
+							track.info.sampleRate = audioSpecificConfig.outputSampleRate;
 						}
 					}
 				}
@@ -1761,6 +1842,28 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				track.info.numberOfChannels = getEac3ChannelCount(config);
+			}; break;
+
+			case 'ddts': { // DTSSpecificBox
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+				assert(track.info?.type === 'audio');
+
+				const bytes = readBytes(slice, Math.min(boxInfo.contentSize, DTS_SPECIFIC_BOX_SIZE));
+				const config = parseDtsSpecificBox(bytes);
+
+				if (!config) {
+					Logging._warn('Invalid ddts box contents, ignoring.');
+					break;
+				}
+
+				track.info.sampleRate = config.sampleRate;
+
+				if (config.numberOfChannels !== null) {
+					track.info.numberOfChannels = config.numberOfChannels;
+				}
 			}; break;
 
 			case 'stts': {
@@ -2698,6 +2801,15 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 
+						case 'tmpo': {
+							if (data instanceof Uint8Array && data.length >= 2) {
+								const bpm = toDataView(data).getInt16(0, false);
+								if (bpm > 0) {
+									this.metadataTags.beatsPerMinute ??= bpm;
+								}
+							}
+						}; break;
+
 						case 'covr':
 						case 'com.apple.quicktime.artwork': {
 							if (data instanceof RichImageData) {
@@ -2845,11 +2957,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 	}
 
 	getBitrate() {
-		return null;
+		return this.internalTrack.maxBitrate;
 	}
 
 	getAverageBitrate() {
-		return null;
+		return this.internalTrack.avgBitrate;
 	}
 
 	async getDurationFromMetadata() {
@@ -3098,24 +3210,31 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				sampleInfo.sampleOffset,
 				sampleInfo.sampleSize,
 			);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			if (!slice) {
 				return null; // Data is outside
 			}
 
 			data = readBytes(slice, sampleInfo.sampleSize);
 
-			if (this.internalTrack.encryptionAuxInfo) {
-				assert(this.internalTrack.encryptionInfo);
+			if (this.internalTrack.encryptionInfo) {
+				let sampleEncryption: SampleEncryptionInfo | null = null;
 
-				const entries = await resolveEncryptionAuxInfo(
-					this.internalTrack.demuxer.reader,
-					this.internalTrack.encryptionInfo,
-					this.internalTrack.encryptionAuxInfo,
-				);
+				if (this.internalTrack.encryptionAuxInfo) {
+					const entries = await resolveEncryptionAuxInfo(
+						this.internalTrack.demuxer.reader,
+						this.internalTrack.encryptionInfo,
+						this.internalTrack.encryptionAuxInfo,
+					);
 
-				if (sampleIndex < entries.length) {
-					data = await decryptSample(this.internalTrack, entries[sampleIndex]!, data, null);
+					if (sampleIndex < entries.length) {
+						sampleEncryption = entries[sampleIndex]!;
+					}
+				}
+
+				sampleEncryption ??= getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
+				if (sampleEncryption) {
+					data = await decryptSample(this.internalTrack, sampleEncryption, data, null);
 				}
 			}
 		}
@@ -3154,15 +3273,19 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				fragmentSample.byteOffset,
 				fragmentSample.byteSize,
 			);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			if (!slice) {
 				return null; // Data is outside
 			}
 
 			data = readBytes(slice, fragmentSample.byteSize);
 
-			if (fragmentSample.encryption) {
-				data = await decryptSample(this.internalTrack, fragmentSample.encryption, data, fragment);
+			if (this.internalTrack.encryptionInfo) {
+				const sampleEncryption = fragmentSample.encryption
+					?? getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
+				if (sampleEncryption) {
+					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment);
+				}
 			}
 		}
 
@@ -3264,7 +3387,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			// Load the header
 			let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			if (!slice) break;
 
 			const boxStartPos = currentPos;
@@ -3315,12 +3438,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 }
 
 class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideoTrackBacking {
-	override internalTrack: InternalVideoTrack;
+	declare internalTrack: InternalVideoTrack;
 	decoderConfigPromise: Promise<VideoDecoderConfig> | null = null;
 
 	constructor(internalTrack: InternalVideoTrack) {
 		super(internalTrack);
-		this.internalTrack = internalTrack;
 	}
 
 	getType() {
@@ -3347,16 +3469,21 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 		return this.internalTrack.info.squarePixelHeight;
 	}
 
-	getRotation() {
-		return this.internalTrack.rotation;
+	getTransformationMatrix(): TransformationMatrix {
+		return [...this.internalTrack.matrix];
 	}
 
 	async getColorSpace(): Promise<VideoColorSpaceInit> {
+		const decoderConfig = await this.getDecoderConfig();
+		if (!decoderConfig) {
+			return this.internalTrack.info.colorSpace;
+		}
+
 		return {
-			primaries: this.internalTrack.info.colorSpace?.primaries,
-			transfer: this.internalTrack.info.colorSpace?.transfer,
-			matrix: this.internalTrack.info.colorSpace?.matrix,
-			fullRange: this.internalTrack.info.colorSpace?.fullRange,
+			primaries: decoderConfig.colorSpace?.primaries,
+			transfer: decoderConfig.colorSpace?.transfer,
+			matrix: decoderConfig.colorSpace?.matrix,
+			fullRange: decoderConfig.colorSpace?.fullRange,
 		};
 	}
 
@@ -3373,12 +3500,64 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 		}
 
 		return this.decoderConfigPromise ??= (async (): Promise<VideoDecoderConfig> => {
-			if (this.internalTrack.info.codec === 'vp9' && !this.internalTrack.info.vp9CodecInfo) {
+			if (this.internalTrack.info.codec === 'avc' && !this.internalTrack.info.codecDescription) {
 				const firstPacket = await this.getFirstPacket({});
-				this.internalTrack.info.vp9CodecInfo = firstPacket && extractVp9CodecInfoFromPacket(firstPacket.data);
-			} else if (this.internalTrack.info.codec === 'av1' && !this.internalTrack.info.av1CodecInfo) {
+				this.internalTrack.info.avcCodecInfo
+					= firstPacket && extractAvcDecoderConfigurationRecord(firstPacket.data);
+			} else if (this.internalTrack.info.codec === 'hevc' && !this.internalTrack.info.codecDescription) {
 				const firstPacket = await this.getFirstPacket({});
-				this.internalTrack.info.av1CodecInfo = firstPacket && extractAv1CodecInfoFromPacket(firstPacket.data);
+				this.internalTrack.info.hevcCodecInfo
+					= firstPacket && extractHevcDecoderConfigurationRecord(firstPacket.data);
+			} else if (
+				this.internalTrack.info.codec === 'vp9'
+				&& (
+					!this.internalTrack.info.vp9CodecInfo
+					// The codec info extracted from vpcC may claim the color space is "undefined"
+					|| !vp9CodecInfoHasColorInfo(this.internalTrack.info.vp9CodecInfo)
+				)
+			) {
+				const firstPacket = await this.getFirstPacket({});
+				const packetInfo = firstPacket && extractVp9CodecInfoFromPacket(firstPacket.data);
+
+				if (packetInfo) {
+					this.internalTrack.info.vp9CodecInfo = {
+						...(this.internalTrack.info.vp9CodecInfo ?? packetInfo),
+						videoFullRangeFlag: packetInfo.videoFullRangeFlag,
+						colourPrimaries: packetInfo.colourPrimaries,
+						transferCharacteristics: packetInfo.transferCharacteristics,
+						matrixCoefficients: packetInfo.matrixCoefficients,
+					};
+				}
+			} else if (
+				this.internalTrack.info.codec === 'av1'
+				&& (
+					!this.internalTrack.info.av1CodecInfo
+					// The codec info extracted from av1C may not contain color space information
+					|| !av1CodecInfoHasColorInfo(
+						this.internalTrack.info.av1CodecInfo,
+					)
+				)
+			) {
+				const firstPacket = await this.getFirstPacket({});
+				const packetInfo = firstPacket && extractAv1CodecInfoFromPacket(firstPacket.data);
+
+				if (packetInfo) {
+					this.internalTrack.info.av1CodecInfo = packetInfo;
+				}
+			} else if (this.internalTrack.info.codec === 'prores' && !this.internalTrack.info.proresCodecInfo) {
+				const firstPacket = await this.getFirstPacket({});
+				this.internalTrack.info.proresCodecInfo
+					= firstPacket && extractProresCodecInfoFromPacket(firstPacket.data);
+			}
+
+			if (!colorSpaceIsComplete(this.internalTrack.info.colorSpace)) {
+				const colorSpace = extractColorSpace(this.internalTrack.info);
+
+				// Fill the missing values
+				this.internalTrack.info.colorSpace.primaries ??= colorSpace.primaries;
+				this.internalTrack.info.colorSpace.transfer ??= colorSpace.transfer;
+				this.internalTrack.info.colorSpace.matrix ??= colorSpace.matrix;
+				this.internalTrack.info.colorSpace.fullRange ??= colorSpace.fullRange;
 			}
 
 			const config: VideoDecoderConfig = {
@@ -3386,7 +3565,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				codedWidth: this.internalTrack.info.width,
 				codedHeight: this.internalTrack.info.height,
 				description: this.internalTrack.info.codecDescription ?? undefined,
-				colorSpace: this.internalTrack.info.colorSpace ?? undefined,
+				colorSpace: this.internalTrack.info.colorSpace,
 			};
 
 			if (
@@ -3403,12 +3582,11 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 }
 
 class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudioTrackBacking {
-	override internalTrack: InternalAudioTrack;
-	decoderConfig: AudioDecoderConfig | null = null;
+	declare internalTrack: InternalAudioTrack;
+	decoderConfigPromise: Promise<AudioDecoderConfig> | null = null;
 
 	constructor(internalTrack: InternalAudioTrack) {
 		super(internalTrack);
-		this.internalTrack = internalTrack;
 	}
 
 	getType() {
@@ -3432,12 +3610,20 @@ class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudio
 			return null;
 		}
 
-		return this.decoderConfig ??= {
-			codec: extractAudioCodecString(this.internalTrack.info),
-			numberOfChannels: this.internalTrack.info.numberOfChannels,
-			sampleRate: this.internalTrack.info.sampleRate,
-			description: this.internalTrack.info.codecDescription ?? undefined,
-		};
+		return this.decoderConfigPromise ??= (async (): Promise<AudioDecoderConfig> => {
+			if (this.internalTrack.info.codec === 'dts' && !this.internalTrack.info.dtsFormat) {
+				// Gotta check the packet to determine the DTS variant
+				const firstPacket = await this.getFirstPacket({});
+				this.internalTrack.info.dtsFormat = firstPacket && extractDtsFourCcFromPacket(firstPacket.data);
+			}
+
+			return {
+				codec: extractAudioCodecString(this.internalTrack.info),
+				numberOfChannels: this.internalTrack.info.numberOfChannels,
+				sampleRate: this.internalTrack.info.sampleRate,
+				description: this.internalTrack.info.codecDescription ?? undefined,
+			};
+		})();
 	}
 }
 
@@ -3613,18 +3799,38 @@ const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timest
 	}
 };
 
-/** Extracts the rotation component from a transformation matrix, in degrees. */
-const extractRotationFromMatrix = (matrix: TransformationMatrix) => {
-	const [a, b] = matrix; // (1, 0) projects onto (a, b), so that's all we need
+const readMatrix = (slice: FileSlice): TransformationMatrix => {
+	return [
+		readFixed_16_16(slice),
+		readFixed_16_16(slice),
+		readFixed_2_30(slice),
+		readFixed_16_16(slice),
+		readFixed_16_16(slice),
+		readFixed_2_30(slice),
+		readFixed_16_16(slice),
+		readFixed_16_16(slice),
+		readFixed_2_30(slice),
+	];
+};
 
-	const radians = Math.atan2(b, a);
-
-	if (!Number.isFinite(radians)) {
-		// Can happen if the entire matrix is 0, for example
-		return 0;
+const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Rational) => {
+	const info = track.info!;
+	if (info.type !== 'video') {
+		return;
 	}
 
-	return radians * (180 / Math.PI);
+	const { num, den } = pixelAspectRatio;
+	if (!(num > 0 && den > 0) || num === den) {
+		return;
+	}
+
+	if (num > den) {
+		info.squarePixelWidth = Math.round(info.width * num / den);
+		info.squarePixelHeight = info.height;
+	} else {
+		info.squarePixelWidth = info.width;
+		info.squarePixelHeight = Math.round(info.height * den / num);
+	}
 };
 
 const sampleTableIsEmpty = (sampleTable: SampleTable) => {
@@ -3675,7 +3881,7 @@ const resolveEncryptionAuxInfo = async (
 	}
 
 	let slice = reader.requestSlice(aux.offset, totalSize);
-	if (slice instanceof Promise) slice = await slice;
+	if (isThenable(slice)) slice = await slice;
 	if (!slice) {
 		throw new Error('Failed to read auxiliary encryption info.');
 	}
@@ -3715,6 +3921,17 @@ const resolveEncryptionAuxInfo = async (
 
 	aux.resolved = entries;
 	return entries;
+};
+
+const getDefaultSampleEncryption = (encryptionInfo: TrackEncryptionInfo): SampleEncryptionInfo | null => {
+	if (!encryptionInfo.defaultConstantIv) {
+		return null;
+	}
+
+	return {
+		iv: encryptionInfo.defaultConstantIv,
+		subsamples: null,
+	};
 };
 
 const decryptSample = async (

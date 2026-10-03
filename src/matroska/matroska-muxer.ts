@@ -14,12 +14,17 @@ import {
 	UNDETERMINED_LANGUAGE,
 	assert,
 	assertNever,
-	colorSpaceIsComplete,
+	colorSpaceIsEmpty,
+	extractRotationFromMatrix,
 	imageMimeTypeToExtension,
 	keyValueIterator,
+	multiplyMatrices,
 	normalizeRotation,
 	promiseWithResolvers,
+	RAD_TO_DEG,
 	Rational,
+	Rotation,
+	rotationMatrix,
 	simplifyRational,
 	textEncoder,
 	toUint8Array,
@@ -69,10 +74,11 @@ import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
 import { parseOpusIdentificationHeader } from '../codec-data';
 import { AttachedFile } from '../metadata';
+import { Logging } from '../logging';
+import { VERSIONED_NAME } from '../version';
 
 const MIN_CLUSTER_TIMESTAMP_MS = -(2 ** 15);
 const MAX_CLUSTER_TIMESTAMP_MS = 2 ** 15 - 1;
-const APP_NAME = 'Mediabunny';
 const SEGMENT_SIZE_BYTES = 6;
 const CLUSTER_SIZE_BYTES = 5;
 
@@ -97,7 +103,11 @@ type MatroskaTrackData = {
 		height: number;
 		aspectRatio: Rational | null;
 		decoderConfig: VideoDecoderConfig;
-		alphaMode: boolean;
+		/**
+		 * Null until the first packet comes in, which is what determines if this track has alpha or not, unless the
+		 * track metadata already hints at transparency.
+		 */
+		alphaMode: boolean | null;
 	};
 } | {
 	track: OutputAudioTrack;
@@ -156,6 +166,7 @@ export class MatroskaMuxer extends Muxer {
 
 	private startTimestamp = Infinity;
 	private endTimestamp = -Infinity;
+	private warnedAboutTooNegativeTimestamp = false;
 
 	constructor(output: Output, format: MkvOutputFormat) {
 		super(output);
@@ -176,6 +187,22 @@ export class MatroskaMuxer extends Muxer {
 
 		await this.writer.flush();
 
+		for (const track of this.output.tracks) {
+			if (track.isVideoTrack() && track.metadata.decoderConfig) {
+				this.getVideoTrackData(
+					track,
+					track.metadata.primingPacket ?? null,
+					{ decoderConfig: track.metadata.decoderConfig },
+				);
+			} else if (track.isAudioTrack() && track.metadata.decoderConfig) {
+				this.getAudioTrackData(
+					track,
+					track.metadata.primingPacket ?? null,
+					{ decoderConfig: track.metadata.decoderConfig },
+				);
+			}
+		}
+
 		release();
 	}
 
@@ -190,7 +217,7 @@ export class MatroskaMuxer extends Muxer {
 			{ id: EBMLId.EBMLMaxIDLength, data: 4 },
 			{ id: EBMLId.EBMLMaxSizeLength, data: 8 },
 			{ id: EBMLId.DocType, data: this.format instanceof WebMOutputFormat ? 'webm' : 'matroska' },
-			{ id: EBMLId.DocTypeVersion, data: 2 },
+			{ id: EBMLId.DocTypeVersion, data: 4 },
 			{ id: EBMLId.DocTypeReadVersion, data: 2 },
 		] };
 		this.ebmlWriter.writeEBML(ebmlHeader);
@@ -216,17 +243,8 @@ export class MatroskaMuxer extends Muxer {
 		const kaxAttachments = new Uint8Array([0x19, 0x41, 0xa4, 0x69]);
 		const kaxTags = new Uint8Array([0x12, 0x54, 0xc3, 0x67]);
 
+		// Entries are ordered by their position in the file
 		const seekHead = { id: EBMLId.SeekHead, data: [
-			{ id: EBMLId.Seek, data: [
-				{ id: EBMLId.SeekID, data: kaxCues },
-				{
-					id: EBMLId.SeekPosition,
-					size: 5,
-					data: writeOffsets
-						? this.ebmlWriter.offsets.get(this.cues!)! - this.segmentDataOffset
-						: 0,
-				},
-			] },
 			{ id: EBMLId.Seek, data: [
 				{ id: EBMLId.SeekID, data: kaxInfo },
 				{
@@ -271,6 +289,16 @@ export class MatroskaMuxer extends Muxer {
 						},
 					] }
 				: null,
+			{ id: EBMLId.Seek, data: [
+				{ id: EBMLId.SeekID, data: kaxCues },
+				{
+					id: EBMLId.SeekPosition,
+					size: 5,
+					data: writeOffsets
+						? this.ebmlWriter.offsets.get(this.cues!)! - this.segmentDataOffset
+						: 0,
+				},
+			] },
 		] };
 		this.seekHead = seekHead;
 	}
@@ -281,8 +309,8 @@ export class MatroskaMuxer extends Muxer {
 
 		const segmentInfo: EBML = { id: EBMLId.Info, data: [
 			{ id: EBMLId.TimestampScale, data: 1e6 },
-			{ id: EBMLId.MuxingApp, data: APP_NAME },
-			{ id: EBMLId.WritingApp, data: APP_NAME },
+			{ id: EBMLId.MuxingApp, data: VERSIONED_NAME },
+			{ id: EBMLId.WritingApp, data: VERSIONED_NAME },
 			!this.format._options.appendOnly ? segmentDuration : null,
 		] };
 		this.segmentInfo = segmentInfo;
@@ -293,8 +321,17 @@ export class MatroskaMuxer extends Muxer {
 		this.tracksElement = tracksElement;
 
 		for (const trackData of this.trackDatas) {
-			const codecId = CODEC_STRING_MAP[trackData.track.source._codec];
+			let codecId = CODEC_STRING_MAP[trackData.track.source._codec];
 			assert(codecId);
+
+			if (trackData.type === 'audio' && trackData.track.source._codec === 'dts') {
+				// We can further refine the Codec ID
+				if (trackData.info.decoderConfig.codec === 'dtse') {
+					codecId = 'A_DTS/EXPRESS';
+				} else if (trackData.info.decoderConfig.codec === 'dtsl') {
+					codecId = 'A_DTS/LOSSLESS';
+				}
+			}
 
 			let seekPreRollNs = 0;
 			if (trackData.type === 'audio' && trackData.track.source._codec === 'opus') {
@@ -338,8 +375,7 @@ export class MatroskaMuxer extends Muxer {
 				trackData.codecPrivate
 					? { id: EBMLId.CodecPrivate, data: toUint8Array(trackData.codecPrivate) }
 					: null,
-				{ id: EBMLId.CodecDelay, data: 0 },
-				{ id: EBMLId.SeekPreRoll, data: seekPreRollNs },
+				seekPreRollNs > 0 ? { id: EBMLId.SeekPreRoll, data: seekPreRollNs } : null,
 				trackData.track.metadata.name !== undefined
 					? { id: EBMLId.Name, data: new EBMLUnicodeString(trackData.track.metadata.name) }
 					: null,
@@ -351,7 +387,7 @@ export class MatroskaMuxer extends Muxer {
 	}
 
 	private videoSpecificTrackInfo(trackData: MatroskaVideoTrackData) {
-		const { frameRate, rotation } = trackData.track.metadata;
+		const { frameRate, transformationMatrix } = trackData.track.metadata;
 
 		const elements: EBMLElement['data'] = [
 			(frameRate
@@ -362,8 +398,37 @@ export class MatroskaMuxer extends Muxer {
 				: null),
 		];
 
-		// Convert from clockwise to counter-clockwise
-		const flippedRotation = rotation ? normalizeRotation(-rotation) : 0;
+		// Matroska can only express the transformation as a rotation and per-axis scales of -1, 0 or 1, so we boil
+		// the metadata down to that: a clockwise rotation followed by the scales
+		let rotation: Rotation;
+		let horizontalScale: number;
+		let verticalScale: number;
+
+		if (transformationMatrix) {
+			rotation = extractRotationFromMatrix(transformationMatrix);
+
+			// Undo the rotation to isolate the scale part
+			const unrotated = multiplyMatrices(rotationMatrix(-rotation), transformationMatrix);
+			horizontalScale = Math.sign(unrotated[0]);
+			verticalScale = Math.sign(unrotated[4]);
+
+			if (verticalScale === -1) {
+				// A vertical flip is the same as a 180 degree rotation and a horizontal flip
+				verticalScale = 1;
+				horizontalScale = -horizontalScale;
+				rotation = normalizeRotation(rotation + 180);
+			}
+		} else {
+			rotation = trackData.track.metadata.rotation ?? 0;
+			horizontalScale = trackData.track.metadata.flip ? -1 : 1;
+			verticalScale = 1;
+		}
+
+		// Matroska applies yaw and pitch (our scales) before roll, but our rotation comes before the scales. On top of
+		// that, Matroska wants counter-clockwise angles.
+		const roll = rotation ? normalizeRotation(horizontalScale === -1 ? rotation : -rotation) : 0;
+		const yaw = Math.round(Math.acos(horizontalScale) * RAD_TO_DEG);
+		const pitch = Math.round(Math.acos(verticalScale) * RAD_TO_DEG);
 
 		const hasNonSquarePixelAspectRatio
 			= !!trackData.info.aspectRatio && (
@@ -379,30 +444,32 @@ export class MatroskaMuxer extends Muxer {
 			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayHeight, data: trackData.info.aspectRatio!.den } : null),
 			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayUnit, data: 3 } : null), // 3 = display aspect ratio
 			trackData.info.alphaMode ? { id: EBMLId.AlphaMode, data: 1 } : null,
-			(colorSpaceIsComplete(colorSpace)
-				? {
+			(colorSpaceIsEmpty(colorSpace)
+				? null
+				: {
 						id: EBMLId.Colour,
 						data: [
 							{
 								id: EBMLId.MatrixCoefficients,
-								data: MATRIX_COEFFICIENTS_MAP[colorSpace.matrix],
+								data: colorSpace?.matrix != null ? MATRIX_COEFFICIENTS_MAP[colorSpace.matrix] : 2,
 							},
 							{
 								id: EBMLId.TransferCharacteristics,
-								data: TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer],
+								data: colorSpace?.transfer != null
+									? TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer]
+									: 2,
 							},
 							{
 								id: EBMLId.Primaries,
-								data: COLOR_PRIMARIES_MAP[colorSpace.primaries],
+								data: colorSpace?.primaries != null ? COLOR_PRIMARIES_MAP[colorSpace.primaries] : 2,
 							},
 							{
 								id: EBMLId.Range,
-								data: colorSpace.fullRange ? 2 : 1,
+								data: colorSpace?.fullRange != null ? (colorSpace.fullRange ? 2 : 1) : 0,
 							},
 						],
-					}
-				: null),
-			(flippedRotation
+					}),
+			(roll || yaw || pitch
 				? {
 						id: EBMLId.Projection,
 						data: [
@@ -410,10 +477,24 @@ export class MatroskaMuxer extends Muxer {
 								id: EBMLId.ProjectionType,
 								data: 0, // rectangular
 							},
-							{
-								id: EBMLId.ProjectionPoseRoll,
-								data: new EBMLFloat32((flippedRotation + 180) % 360 - 180), // [0, 270] -> [-180, 90]
-							},
+							(yaw
+								? {
+										id: EBMLId.ProjectionPoseYaw,
+										data: new EBMLFloat32(yaw),
+									}
+								: null),
+							(pitch
+								? {
+										id: EBMLId.ProjectionPosePitch,
+										data: new EBMLFloat32(pitch),
+									}
+								: null),
+							(roll
+								? {
+										id: EBMLId.ProjectionPoseRoll,
+										data: new EBMLFloat32((roll + 180) % 360 - 180), // [0, 270] -> [-180, 90]
+									}
+								: null),
 						],
 					}
 				: null),
@@ -488,6 +569,11 @@ export class MatroskaMuxer extends Muxer {
 				case 'genre': {
 					addSimpleTag('GENRE', value);
 					writtenTags.add('GENRE');
+				}; break;
+
+				case 'beatsPerMinute': {
+					addSimpleTag('BPM', value.toString());
+					writtenTags.add('BPM');
 				}; break;
 
 				case 'comment': {
@@ -691,7 +777,7 @@ export class MatroskaMuxer extends Muxer {
 	}
 
 	private allTracksAreKnown() {
-		for (const track of this.output._tracks) {
+		for (const track of this.output.tracks) {
 			if (!track.source._closed && !this.trackDatas.some(x => x.track === track)) {
 				return false; // We haven't seen a sample from this open track yet
 			}
@@ -724,13 +810,13 @@ export class MatroskaMuxer extends Muxer {
 		});
 	}
 
-	private getVideoTrackData(track: OutputVideoTrack, packet: EncodedPacket, meta?: EncodedVideoChunkMetadata) {
+	private getVideoTrackData(track: OutputVideoTrack, packet: EncodedPacket | null, meta?: EncodedVideoChunkMetadata) {
 		const existingTrackData = this.trackDatas.find(x => x.track === track);
 		if (existingTrackData) {
 			return existingTrackData as MatroskaVideoTrackData;
 		}
 
-		validateVideoChunkMetadata(meta);
+		validateVideoChunkMetadata(meta, track.source._codec);
 
 		assert(meta);
 		assert(meta.decoderConfig);
@@ -755,7 +841,7 @@ export class MatroskaMuxer extends Muxer {
 				height: meta.decoderConfig.codedHeight,
 				aspectRatio,
 				decoderConfig: meta.decoderConfig,
-				alphaMode: !!packet.sideData.alpha, // The first packet determines if this track has alpha or not
+				alphaMode: track.metadata.canBeTransparent || (packet ? !!packet.sideData.alpha : null),
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
@@ -791,13 +877,13 @@ export class MatroskaMuxer extends Muxer {
 		return newTrackData;
 	}
 
-	private getAudioTrackData(track: OutputAudioTrack, packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) {
+	private getAudioTrackData(track: OutputAudioTrack, packet: EncodedPacket | null, meta?: EncodedAudioChunkMetadata) {
 		const existingTrackData = this.trackDatas.find(x => x.track === track);
 		if (existingTrackData) {
 			return existingTrackData as MatroskaAudioTrackData;
 		}
 
-		validateAudioChunkMetadata(meta);
+		validateAudioChunkMetadata(meta, track.source._codec);
 
 		assert(meta);
 		assert(meta.decoderConfig);
@@ -808,6 +894,11 @@ export class MatroskaMuxer extends Muxer {
 		if (track.source._codec === 'aac' && !decoderConfig.description) {
 			// Matroska stores raw AAC with AudioSpecificConfig in CodecPrivate, not ADTS-wrapped data.
 			// Parse the first packet to extract the AudioSpecificConfig.
+
+			if (!packet) {
+				throw new Error('No AAC description provided; you must therefore provide a priming packet.');
+			}
+
 			const adtsFrame = readAdtsFrameHeader(FileSlice.tempFromBytes(packet.data));
 			if (!adtsFrame) {
 				throw new Error(
@@ -827,8 +918,8 @@ export class MatroskaMuxer extends Muxer {
 
 			decoderConfig.description = buildAacAudioSpecificConfig({
 				objectType: adtsFrame.objectType,
-				sampleRate,
-				numberOfChannels,
+				outputSampleRate: sampleRate,
+				outputNumberOfChannels: numberOfChannels,
 			});
 			requiresAdtsStripping = true;
 		}
@@ -896,6 +987,7 @@ export class MatroskaMuxer extends Muxer {
 
 		try {
 			const trackData = this.getVideoTrackData(track, packet, meta);
+			trackData.info.alphaMode ??= !!packet.sideData.alpha;
 
 			let packetData = packet.data;
 			if (track.source._codec === 'prores') {
@@ -1157,6 +1249,15 @@ export class MatroskaMuxer extends Muxer {
 		const relativeTimestamp = msTimestamp - this.currentClusterStartMsTimestamp!;
 		if (relativeTimestamp < MIN_CLUSTER_TIMESTAMP_MS) {
 			// The block lies too far in the past, it's not representable within this cluster
+			if (!this.warnedAboutTooNegativeTimestamp) {
+				const formatName = this.format instanceof WebMOutputFormat ? 'WebM' : 'Matroska';
+				Logging._warn(
+					`Packets had to be discarded because their timestamp is too negative to represent in`
+					+ ` ${formatName}.`,
+				);
+				this.warnedAboutTooNegativeTimestamp = true;
+			}
+
 			return;
 		}
 
@@ -1219,6 +1320,8 @@ export class MatroskaMuxer extends Muxer {
 
 	/** Creates a new Cluster element to contain media chunks. */
 	private createNewCluster(msTimestamp: number) {
+		msTimestamp = Math.max(0, msTimestamp); // Cluster timestamps cannot be negative
+
 		if (this.currentCluster) {
 			this.finalizeCurrentCluster();
 		}
@@ -1279,7 +1382,7 @@ export class MatroskaMuxer extends Muxer {
 		for (const [msTimestamp, trackDatas] of groupedAndSortedByTimestamp) {
 			assert(this.cues);
 			(this.cues.data as EBML[]).push({ id: EBMLId.CuePoint, data: [
-				{ id: EBMLId.CueTime, data: msTimestamp },
+				{ id: EBMLId.CueTime, data: Math.max(0, msTimestamp) }, // CueTime is unsigned
 				// Create CueTrackPositions for each track that starts at this timestamp
 				...trackDatas.map((trackData) => {
 					return { id: EBMLId.CueTrackPositions, data: [
@@ -1341,9 +1444,7 @@ export class MatroskaMuxer extends Muxer {
 			this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
 
 			// Write the duration of the media to the Segment
-			const duration = this.startTimestamp === Infinity
-				? 0
-				: this.endTimestamp - this.startTimestamp;
+			const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp;
 			this.segmentDuration!.data = new EBMLFloat64(duration);
 			this.writer.seek(this.ebmlWriter.offsets.get(this.segmentDuration!)!);
 			this.ebmlWriter.writeEBML(this.segmentDuration);

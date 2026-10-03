@@ -6,7 +6,7 @@ import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget, StreamTarget, StreamTargetChunk } from '../../src/target.js';
 import { CanvasSource, EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
-import { QUALITY_HIGH } from '../../src/encode.js';
+import { Quality } from '../../src/encode.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { assert } from '../../src/misc.js';
 import { Conversion } from '../../src/conversion.js';
@@ -15,13 +15,13 @@ test('MPEG-TS output format', async () => {
 	const format = new MpegTsOutputFormat();
 	expect(format.mimeType).toBe('video/MP2T');
 	expect(format.fileExtension).toBe('.ts');
-	expect(format.supportsVideoRotationMetadata).toBe(false);
-	expect(format.getSupportedCodecs()).toEqual(['avc', 'hevc', 'aac', 'mp3', 'ac3', 'eac3']);
+	expect(format.supportsVideoTransformationMetadata).toBe(false);
+	expect(format.getSupportedCodecs()).toEqual(['avc', 'hevc', 'aac', 'mp3', 'ac3', 'eac3', 'dts']);
 	expect(format.getSupportedTrackCounts()).toEqual({
 		video: { min: 0, max: 16 },
 		audio: { min: 0, max: 32 },
 		subtitle: { min: 0, max: 0 },
-		total: { min: 1, max: 48 },
+		total: { min: 0, max: 48 },
 	});
 });
 
@@ -59,7 +59,7 @@ test('MPEG-TS muxing with AVC and AAC', async () => {
 
 	const videoSource = new CanvasSource(canvas, {
 		codec: 'avc',
-		bitrate: QUALITY_HIGH,
+		quality: new Quality('high'),
 	});
 	output.addVideoTrack(videoSource);
 
@@ -351,7 +351,7 @@ test('MPEG-TS muxing with no data', async () => {
 	const canvas = new OffscreenCanvas(640, 480);
 	const videoSource = new CanvasSource(canvas, {
 		codec: 'avc',
-		bitrate: QUALITY_HIGH,
+		quality: new Quality('high'),
 	});
 	output.addVideoTrack(videoSource);
 
@@ -381,7 +381,7 @@ test('MPEG-TS muxing with video only', async () => {
 
 	const videoSource = new CanvasSource(canvas, {
 		codec: 'avc',
-		bitrate: QUALITY_HIGH,
+		quality: new Quality('high'),
 	});
 	output.addVideoTrack(videoSource);
 
@@ -690,7 +690,7 @@ test('MPEG-TS muxing with StreamTarget', async () => {
 
 	const videoSource = new CanvasSource(canvas, {
 		codec: 'avc',
-		bitrate: QUALITY_HIGH,
+		quality: new Quality('high'),
 	});
 	output.addVideoTrack(videoSource);
 
@@ -738,3 +738,67 @@ test('MPEG-TS muxing with StreamTarget', async () => {
 	}
 	expect(videoPacketCount).toBe(frameCount);
 });
+
+test('MPEG-TS muxing with negative start timestamps', async () => {
+	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1);
+});
+
+test('MPEG-TS muxing with wholly negative timestamps', async () => {
+	await testNegativeTimestampRoundTrip([-1, -0.9, -0.8, -0.7, -0.6], 0.1);
+});
+
+const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: number) => {
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const canvas = new OffscreenCanvas(640, 480);
+	const context = canvas.getContext('2d')!;
+	context.fillStyle = '#0000ff';
+	context.fillRect(0, 0, canvas.width, canvas.height);
+
+	const source = new CanvasSource(canvas, {
+		codec: 'avc',
+		quality: new Quality('high'),
+	});
+	output.addVideoTrack(source, { frameRate: 10 });
+
+	await output.start();
+
+	for (const timestamp of timestamps) {
+		await source.add(timestamp, duration);
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const outputPackets = [];
+	for await (const packet of sink.packets()) {
+		outputPackets.push(packet);
+	}
+
+	const expectedPackets = timestamps.map(timestamp => ({ timestamp, duration }));
+	expect(outputPackets.map(packet => ({
+		timestamp: packet.timestamp,
+		duration: packet.duration,
+	}))).toEqual(expectedPackets);
+
+	for (const expectedPacket of expectedPackets) {
+		const outputPacket = await sink.getPacket(expectedPacket.timestamp);
+		assert(outputPacket);
+
+		expect({
+			timestamp: outputPacket.timestamp,
+			duration: outputPacket.duration,
+		}).toEqual(expectedPacket);
+	}
+};

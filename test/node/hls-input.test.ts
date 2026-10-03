@@ -3,7 +3,7 @@ import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, I
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
-import { CustomPathedSource } from '../../src/source.js';
+import { CustomPathedSource, FilePathSource } from '../../src/source.js';
 
 // A lot of test cases taken from:
 // https://github.com/video-dev/hls.js/blob/master/tests/test-streams.js
@@ -890,6 +890,33 @@ test.concurrent('#EXT-X-STREAM-INF tags without BANDWIDTH attribute are rejected
 	await expect(input.getTracks()).rejects.toThrow('BANDWIDTH');
 });
 
+test.concurrent('URI-less video and audio renditions inherit variant bandwidth', async () => {
+	const text = `#EXTM3U
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="video",NAME="Source",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=3214134,AVERAGE-BANDWIDTH=2800000,CODECS="avc1.64001F,mp4a.40.2",VIDEO="video",AUDIO="audio"
+variant.m3u8
+`;
+
+	using input = new Input({
+		formats: HLS_FORMATS,
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			assert(path === 'master.m3u8');
+			return new BufferSource(new TextEncoder().encode(text));
+		}),
+	});
+
+	const videoTracks = await input.getVideoTracks();
+	const audioTracks = await input.getAudioTracks();
+	expect(videoTracks).toHaveLength(1);
+	expect(audioTracks).toHaveLength(1);
+
+	for (const track of [...videoTracks, ...audioTracks]) {
+		expect(await track.getBitrate()).toBe(3214134);
+		expect(await track.getAverageBitrate()).toBe(2800000);
+	}
+});
+
 test.concurrent('Missing media tag codec', async () => {
 	using input = new Input({
 		source: new UrlSource('https://playertest.longtailvideo.com/adaptive/elephants_dream_v4/index.m3u8'),
@@ -1082,4 +1109,120 @@ test.concurrent('SourceRequest.isRoot', async () => {
 	assert(videoTrack);
 
 	await videoTrack.computeDuration();
+});
+
+test.concurrent('#EXT-X-DEFINE NAME and VALUE variables are applied', async () => {
+	const text = `#EXTM3U
+#EXT-X-DEFINE:NAME="prefix",VALUE="Main"
+#EXT-X-DEFINE:NAME="trackName",VALUE="{$prefix} Track"
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f",NAME="{$trackName}",URI="video.m3u8"
+`;
+
+	const input = new Input({
+		formats: ALL_FORMATS,
+		source: new CustomPathedSource('master.m3u8', () => new BufferSource(new TextEncoder().encode(text))),
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks).toHaveLength(1);
+	expect(await tracks[0]!.getName()).toBe('Main Track');
+});
+
+test.concurrent('#EXT-X-DEFINE QUERYPARAM variables can be IMPORTed into media playlists', async () => {
+	const rootPath = 'https://example.com/master.m3u8'
+		+ '?mediaPlaylistPath=variant%2Em3u8&segmentPath=0%2Ets';
+	const expectedMediaPlaylistPath = 'https://example.com/variant.m3u8';
+	const expectedSegmentPath = 'https://example.com/0.ts';
+	const multivariantPlaylist = `#EXTM3U
+#EXT-X-DEFINE:QUERYPARAM="mediaPlaylistPath"
+#EXT-X-DEFINE:QUERYPARAM="segmentPath"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f"
+{$mediaPlaylistPath}
+`;
+	const mediaPlaylist = `#EXTM3U
+#EXT-X-DEFINE:IMPORT="segmentPath"
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+{$segmentPath}
+#EXT-X-ENDLIST
+`;
+	const requestedPaths: string[] = [];
+
+	using input = new Input({
+		source: new CustomPathedSource(
+			rootPath,
+			({ path }) => {
+				requestedPaths.push(path);
+
+				if (path === rootPath) {
+					return new BufferSource(new TextEncoder().encode(multivariantPlaylist));
+				}
+				if (path === expectedMediaPlaylistPath) {
+					return new BufferSource(new TextEncoder().encode(mediaPlaylist));
+				}
+				if (path === expectedSegmentPath) {
+					return new FilePathSource('./test/public/0.ts');
+				}
+
+				throw new Error(`Unexpected source path "${path}".`);
+			},
+		),
+		formats: HLS_FORMATS,
+	});
+
+	// Trigger media loading so the substituted playlist and segment paths are added to requestedPaths.
+	await input.getFirstTimestamp();
+
+	expect(requestedPaths).toContain(expectedMediaPlaylistPath);
+	expect(requestedPaths).toContain(expectedSegmentPath);
+});
+
+test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {
+	const cases = [
+		{
+			tag: '#EXT-X-DEFINE:VALUE="value"',
+			error: 'exactly one of NAME, IMPORT, or QUERYPARAM must be present',
+		},
+		{
+			tag: '#EXT-X-DEFINE:NAME="name",IMPORT="name",VALUE="value"',
+			error: 'exactly one of NAME, IMPORT, or QUERYPARAM must be present',
+		},
+		{
+			tag: '#EXT-X-DEFINE:NAME="name"',
+			error: 'NAME requires VALUE',
+		},
+		{
+			tag: '#EXT-X-DEFINE:NAME="invalid name",VALUE="value"',
+			error: 'invalid variable name',
+		},
+		{
+			tag: '#EXT-X-DEFINE:IMPORT="missing"',
+			error: 'cannot import undefined variable',
+		},
+		{
+			tag: '#EXT-X-DEFINE:QUERYPARAM="missing"',
+			error: 'query parameter "missing" is missing',
+		},
+		{
+			tag: '#EXT-X-DEFINE:NAME="name",VALUE="value"\n'
+				+ '#EXT-X-DEFINE:NAME="name",VALUE="other"',
+			error: 'variable "name" is already defined',
+		},
+		{
+			tag: '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f",URI="{$missing}"',
+			error: 'variable "missing" is referenced before being defined',
+		},
+	];
+
+	for (const { tag, error } of cases) {
+		using input = new Input({
+			source: new CustomPathedSource(
+				'https://example.com/master.m3u8',
+				() => new BufferSource(new TextEncoder().encode(`#EXTM3U\n${tag}\n`)),
+			),
+			formats: HLS_FORMATS,
+		});
+
+		await expect(input.getTracks()).rejects.toThrow(error);
+	}
 });

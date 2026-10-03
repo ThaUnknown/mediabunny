@@ -17,7 +17,9 @@ import {
 	assert,
 	AsyncMutex,
 	binarySearchLessOrEqual,
+	clamp,
 	findLast,
+	isThenable,
 	last,
 	roundIfAlmostInteger,
 	toDataView,
@@ -72,7 +74,7 @@ export class OggDemuxer extends Demuxer {
 
 			while (true) {
 				let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-				if (slice instanceof Promise) slice = await slice;
+				if (isThenable(slice)) slice = await slice;
 				if (!slice) break;
 
 				const page = readPageHeader(slice);
@@ -274,7 +276,7 @@ export class OggDemuxer extends Demuxer {
 		while (true) {
 			// Load the entire page data
 			let pageSlice = this.reader.requestSlice(currentPage.dataStartPos, currentPage.dataSize);
-			if (pageSlice instanceof Promise) pageSlice = await pageSlice;
+			if (isThenable(pageSlice)) pageSlice = await pageSlice;
 			assert(pageSlice);
 			const pageData = readBytes(pageSlice, currentPage.dataSize);
 
@@ -299,7 +301,7 @@ export class OggDemuxer extends Demuxer {
 			let currentPos = currentPage.headerStartPos + currentPage.totalSize;
 			while (true) {
 				let headerSlice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-				if (headerSlice instanceof Promise) headerSlice = await headerSlice;
+				if (isThenable(headerSlice)) headerSlice = await headerSlice;
 				if (!headerSlice) {
 					return null;
 				}
@@ -358,7 +360,7 @@ export class OggDemuxer extends Demuxer {
 		let currentPos = lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize;
 		while (true) {
 			let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			if (!slice) {
 				return null;
 			}
@@ -412,6 +414,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	encodedPacketToMetadata = new WeakMap<EncodedPacket, EncodedPacketMetadata>();
 	sequentialScanCache: EncodedPacketMetadata[] = [];
 	sequentialScanMutex = new AsyncMutex();
+	firstTimestampInSamplesPromise: Promise<number> | null = null;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
 		// Opus always uses a fixed sample rate for its internal calculations, even if the actual rate is different
@@ -533,17 +536,31 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return null;
 		}
 
-		const { durationInSamples, vorbisBlockSize } = extractSampleMetadata(
+		const sampleMetadata = extractSampleMetadata(
 			packet.data,
 			this.bitstream.codecInfo,
 			additional.vorbisLastBlocksize,
 		);
+		const { vorbisBlockSize } = sampleMetadata;
+		let { durationInSamples } = sampleMetadata;
+
+		const isEos = !!(packet.endPage.headerType & 0x04);
+		if (isEos && packet.endSegmentIndex === packet.endPage.lacingValues.length - 1) {
+			// This is the last packet of the bitstream. The final page's granule position may be smaller than what
+			// the packet durations imply, in which case the excess samples at the end are to be trimmed.
+			const endTimestampInSamples = this.granulePositionToTimestampInSamples(packet.endPage.granulePosition);
+			durationInSamples = clamp(endTimestampInSamples - additional.timestampInSamples, 0, durationInSamples);
+		}
+
+		// Clamp both ends so that a packet partially before zero doesn't overlap with the following packet
+		const startTimestampInSamples = Math.max(additional.timestampInSamples, 0);
+		const endTimestampInSamples = Math.max(additional.timestampInSamples + durationInSamples, 0);
 
 		const encodedPacket = new EncodedPacket(
 			options.metadataOnly ? PLACEHOLDER_DATA : packet.data,
 			'key',
-			Math.max(0, additional.timestampInSamples) / this.internalSampleRate,
-			durationInSamples / this.internalSampleRate,
+			startTimestampInSamples / this.internalSampleRate,
+			(endTimestampInSamples - startTimestampInSamples) / this.internalSampleRate,
 			packet.endPage.headerStartPos + packet.endSegmentIndex,
 			packet.data.byteLength,
 		);
@@ -558,6 +575,54 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		return encodedPacket;
 	}
 
+	getFirstTimestampInSamples() {
+		return this.firstTimestampInSamplesPromise ??= (async () => {
+			const defaultTimestampInSamples = this.granulePositionToTimestampInSamples(0);
+
+			assert(this.bitstream.lastMetadataPacket);
+			let position = await this.demuxer.findNextPacketStart(this.bitstream.lastMetadataPacket);
+			if (!position) {
+				return defaultTimestampInSamples;
+			}
+
+			// The first page on which a packet completes may have a granule position larger than the number of
+			// samples in the packets completing on it, meaning the stream starts at a later time. So, let's sum up the
+			// durations of these packets and compare.
+			let firstEndPage: Page | null = null;
+			let totalDurationInSamples = 0;
+			let vorbisLastBlocksize: number | null = null;
+
+			while (position) {
+				const packet = await this.demuxer.readPacket(position.startPage, position.startSegmentIndex);
+				if (!packet) {
+					break;
+				}
+
+				firstEndPage ??= packet.endPage;
+				if (packet.endPage.headerStartPos !== firstEndPage.headerStartPos) {
+					break;
+				}
+
+				const { durationInSamples, vorbisBlockSize } = extractSampleMetadata(
+					packet.data,
+					this.bitstream.codecInfo,
+					vorbisLastBlocksize,
+				);
+				totalDurationInSamples += durationInSamples;
+				vorbisLastBlocksize = vorbisBlockSize;
+
+				position = await this.demuxer.findNextPacketStart(packet);
+			}
+
+			if (!firstEndPage) {
+				return defaultTimestampInSamples;
+			}
+
+			// A smaller granule position is only legal on the final page, where it signals end trimming
+			return defaultTimestampInSamples + Math.max(firstEndPage.granulePosition - totalDurationInSamples, 0);
+		})();
+	}
+
 	async getFirstPacket(options: PacketRetrievalOptions) {
 		assert(this.bitstream.lastMetadataPacket);
 		const packetPosition = await this.demuxer.findNextPacketStart(this.bitstream.lastMetadataPacket);
@@ -565,12 +630,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return null;
 		}
 
-		let timestampInSamples = 0;
-		if (this.bitstream.codecInfo.codec === 'opus') {
-			assert(this.bitstream.codecInfo.opusInfo);
-			timestampInSamples -= this.bitstream.codecInfo.opusInfo.preSkip;
-		}
-
+		const timestampInSamples = await this.getFirstTimestampInSamples();
 		const packet = await this.demuxer.readPacket(packetPosition.startPage, packetPosition.startSegmentIndex);
 
 		return this.createEncodedPacketFromOggPacket(
@@ -618,11 +678,12 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		}
 
 		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
-		if (timestampInSamples === 0) {
-			// Fast path for timestamp 0 - avoids binary search when playing back from the start
+		const firstTimestampInSamples = await this.getFirstTimestampInSamples();
+		if (timestampInSamples === Math.max(firstTimestampInSamples, 0)) {
+			// Fast path for the first timestamp - avoids binary search when playing back from the start
 			return this.getFirstPacket(options);
 		}
-		if (timestampInSamples < 0) {
+		if (timestampInSamples < Math.max(firstTimestampInSamples, 0)) {
 			// There's nothing here
 			return null;
 		}
@@ -658,11 +719,16 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				);
 
 				let searchSlice = this.demuxer.reader.requestSlice(searchStartPos, until - searchStartPos);
-				if (searchSlice instanceof Promise) searchSlice = await searchSlice;
+				if (isThenable(searchSlice)) searchSlice = await searchSlice;
 				assert(searchSlice);
 
 				const found = findNextPageHeader(searchSlice, until);
 				if (!found) {
+					if (high <= mid + MIN_PAGE_HEADER_SIZE) {
+						// The range can't be narrowed any further
+						break outer;
+					}
+
 					high = mid + MIN_PAGE_HEADER_SIZE;
 					continue outer;
 				}
@@ -672,7 +738,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					MIN_PAGE_HEADER_SIZE,
 					MAX_PAGE_HEADER_SIZE,
 				);
-				if (headerSlice instanceof Promise) headerSlice = await headerSlice;
+				if (isThenable(headerSlice)) headerSlice = await headerSlice;
 				assert(headerSlice);
 
 				const page = readPageHeader(headerSlice);
@@ -685,7 +751,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					pageValid = true;
 				} else {
 					let pageSlice = this.demuxer.reader.requestSlice(page.headerStartPos, page.totalSize);
-					if (pageSlice instanceof Promise) pageSlice = await pageSlice;
+					if (isThenable(pageSlice)) pageSlice = await pageSlice;
 					assert(pageSlice);
 
 					// Validate the page by checking checksum
@@ -759,7 +825,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 			const nextPos = currentPage.headerStartPos + currentPage.totalSize;
 			let slice = this.demuxer.reader.requestSliceRange(nextPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-			if (slice instanceof Promise) slice = await slice;
+			if (isThenable(slice)) slice = await slice;
 			assert(slice);
 
 			const nextPage = readPageHeader(slice);
@@ -783,7 +849,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		let endSegmentIndex = 0;
 
 		if (currentPage.headerStartPos === startPosition.startPage.headerStartPos) {
-			currentTimestampInSamples = this.granulePositionToTimestampInSamples(0);
+			currentTimestampInSamples = firstTimestampInSamples;
 			currentTimestampIsCorrect = true;
 			currentSegmentIndex = 0;
 		} else {
@@ -973,6 +1039,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				);
 			} else {
 				currentPacket = await this.getFirstPacket(options);
+				if (currentPacket && currentPacket.timestamp > timestamp) {
+					// The stream starts after the requested timestamp
+					return null;
+				}
 			}
 
 			let i = 0;

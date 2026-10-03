@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
 import { assert, toUint8Array } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
@@ -10,8 +11,9 @@ import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { FlacOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
+import { VERSIONED_NAME } from '../../src/version.js';
 
-const __dirname = new URL('.', import.meta.url).pathname;
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 test('can loop over all samples', async () => {
 	const filePath = path.join(__dirname, '..', 'public/sample.flac');
@@ -205,7 +207,8 @@ test('can re-mux a .flac', async () => {
 		...otherInputMetadataTags,
 		raw: {
 			...otherInputMetadataTags.raw,
-			vendor: 'Mediabunny',
+			DATE: '2020-01-01',
+			vendor: VERSIONED_NAME,
 		},
 		images: inputImages,
 	});

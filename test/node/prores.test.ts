@@ -12,7 +12,7 @@ import { assert } from '../../src/misc.js';
 
 const SAMPLE_URL = 'https://pub-1ee78aacb848486482b20a72b55b3121.r2.dev/turbores-sample.mov';
 
-test.concurrent('ProRes MOV file reading', async () => {
+test.concurrent('ProRes MOV file reading', { timeout: 20_000 }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -28,7 +28,7 @@ test.concurrent('ProRes MOV file reading', async () => {
 	expect(decoderConfig.description).toBeUndefined();
 });
 
-test.concurrent('ProRes transmuxing into MOV', { timeout: 10_000 }, async () => {
+test.concurrent('ProRes transmuxing into MOV', { timeout: 20_000 }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -65,7 +65,7 @@ test.concurrent('ProRes transmuxing into MOV', { timeout: 10_000 }, async () => 
 	expect(decoderConfig.description).toBeUndefined();
 });
 
-test.concurrent('ProRes transmuxing into MKV', { timeout: 10_000 }, async () => {
+test.concurrent('ProRes transmuxing into MKV', { timeout: 20_000 }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -114,7 +114,7 @@ test.concurrent('ProRes transmuxing into MKV', { timeout: 10_000 }, async () => 
 	expect(str.includes('icpf')).toBe(true);
 });
 
-test('Custom coder registration', { timeout: 10_000 }, async () => {
+test('Custom coder registration', { timeout: 20_000 }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -131,7 +131,7 @@ test('Custom coder registration', { timeout: 10_000 }, async () => {
 	expect(await videoTrack.canDecode()).toBe(true);
 });
 
-test('ProRes decoding', { timeout: 10_000 }, async () => {
+test('ProRes decoding', { timeout: 20_000 }, async () => {
 	registerProresDecoder();
 
 	using input = new Input({

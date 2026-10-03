@@ -8,6 +8,7 @@
 
 import { parsePcmCodec, PCM_AUDIO_CODECS, PcmAudioCodec, VideoCodec, AudioCodec } from './codec';
 import {
+	addAvcBitstreamRestriction,
 	AvcNalUnitType,
 	concatAvcNalUnits,
 	deserializeAvcDecoderConfigurationRecord,
@@ -19,6 +20,7 @@ import {
 	iterateHevcNalUnits,
 	parseAvcSps,
 	sanitizeHevcPacketForChromium,
+	serializeAvcDecoderConfigurationRecord,
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
@@ -29,6 +31,7 @@ import {
 	assertNever,
 	CallSerializer,
 	clamp,
+	colorSpaceIsComplete,
 	getInt24,
 	getUint24,
 	insertSorted,
@@ -38,6 +41,7 @@ import {
 	isWebKit,
 	last,
 	mapAsyncGenerator,
+	missingWebCodecsClassMessage,
 	promiseWithResolvers,
 	removeItem,
 	Rotation,
@@ -471,6 +475,7 @@ export abstract class BaseMediaSampleSink<
 		let decoderIsFlushed = false;
 		let ended = false;
 		let terminated = false;
+		let decoder: DecoderWrapper<MediaSample> | null = null;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -486,7 +491,7 @@ export abstract class BaseMediaSampleSink<
 
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
-			const decoder = await this._createDecoder((sample) => {
+			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
 				if (sample.timestamp >= endTimestamp) {
 					ended = true;
@@ -569,20 +574,21 @@ export abstract class BaseMediaSampleSink<
 			if (!terminated && !this._track.input._disposed) {
 				await decoder.flush();
 			}
-			decoder.close();
 
 			if (!firstSampleQueued && lastSample) {
 				sampleQueue.push(lastSample);
 			}
 
 			decoderIsFlushed = true;
-			onQueueNotEmpty(); // To unstuck the generator
+			onQueueNotEmpty(); // To unstuck (unstick?) the generator
 		})().catch((error) => {
 			if (!hasOutOfBandError) {
 				outOfBandError = error;
 				hasOutOfBandError = true;
 				onQueueNotEmpty();
 			}
+		}).finally(() => {
+			decoder?.close();
 		});
 
 		const track = this._track;
@@ -597,11 +603,18 @@ export abstract class BaseMediaSampleSink<
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
+						// Once next() throws, the consumer will never call return(), so terminate the
+						// iteration here - otherwise, the pump keeps queueing decoded samples that
+						// nothing can ever close.
+						terminated = true;
+						ended = true;
 						closeSamples();
 						throw new InputDisposedError();
 					} else if (terminated) {
 						return { value: undefined, done: true };
 					} else if (hasOutOfBandError) {
+						terminated = true;
+						ended = true;
 						closeSamples();
 						throw outOfBandError;
 					} else if (sampleQueue.length > 0) {
@@ -647,6 +660,7 @@ export abstract class BaseMediaSampleSink<
 		let { promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers();
 		let decoderIsFlushed = false;
 		let terminated = false;
+		let decoder: DecoderWrapper<MediaSample> | null = null;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -668,7 +682,7 @@ export abstract class BaseMediaSampleSink<
 
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
-			const decoder = await this._createDecoder((sample) => {
+			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
 
 				if (terminated) {
@@ -711,6 +725,7 @@ export abstract class BaseMediaSampleSink<
 
 			const decodePackets = async () => {
 				assert(lastKeyPacket);
+				assert(decoder);
 
 				// Start at the current key packet
 				let currentPacket = lastKeyPacket;
@@ -738,6 +753,7 @@ export abstract class BaseMediaSampleSink<
 			};
 
 			const flushDecoder = async () => {
+				assert(decoder);
 				await decoder.flush();
 
 				// We don't expect this list to have any elements in it anymore, but in case it does, let's emit
@@ -796,7 +812,6 @@ export abstract class BaseMediaSampleSink<
 
 				await flushDecoder();
 			}
-			decoder.close();
 
 			decoderIsFlushed = true;
 			onQueueNotEmpty(); // To unstuck the generator
@@ -806,6 +821,8 @@ export abstract class BaseMediaSampleSink<
 				hasOutOfBandError = true;
 				onQueueNotEmpty();
 			}
+		}).finally(() => {
+			decoder?.close();
 		});
 
 		const track = this._track;
@@ -819,11 +836,16 @@ export abstract class BaseMediaSampleSink<
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
+						// Once next() throws, the consumer will never call return(), so terminate the
+						// iteration here - otherwise, the pump keeps queueing decoded samples that
+						// nothing can ever close.
+						terminated = true;
 						closeSamples();
 						throw new InputDisposedError();
 					} else if (terminated) {
 						return { value: undefined, done: true };
 					} else if (hasOutOfBandError) {
+						terminated = true;
 						closeSamples();
 						throw outOfBandError;
 					} else if (sampleQueue.length > 0) {
@@ -896,6 +918,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		public codec: VideoCodec,
 		public decoderConfig: VideoDecoderConfig,
 		public rotation: Rotation,
+		public flip: boolean,
 		public timeResolution: number,
 	) {
 		super(onSample, onError);
@@ -937,19 +960,53 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				}
 			};
 
-			if (codec === 'avc' && this.decoderConfig.description && isChromium()) {
-				// Chromium has/had a bug with playing interlaced AVC (https://issues.chromium.org/issues/456919096)
-				// which can be worked around by requesting that software decoding be used. So, here we peek into the
-				// AVC description, if present, and switch to software decoding if we find interlaced content.
-				const record = deserializeAvcDecoderConfigurationRecord(toUint8Array(this.decoderConfig.description));
-				if (record && record.sequenceParameterSets.length > 0) {
-					const sps = parseAvcSps(record.sequenceParameterSets[0]!);
-					if (sps && sps.frameMbsOnlyFlag === 0) {
-						this.decoderConfig = {
-							...this.decoderConfig,
-							hardwareAcceleration: 'prefer-software',
-						};
+			if (isChromium()) {
+				if (codec === 'avc' && this.decoderConfig.description) {
+					const record = deserializeAvcDecoderConfigurationRecord(
+						toUint8Array(this.decoderConfig.description),
+					);
+					if (record && record.sequenceParameterSets.length > 0) {
+						const sps = parseAvcSps(record.sequenceParameterSets[0]!);
+						if (sps) {
+							if (sps.frameMbsOnlyFlag === 0) {
+								// Chromium has/had a bug with playing interlaced AVC
+								// (https://issues.chromium.org/issues/456919096) which can be worked around by
+								// requesting that software decoding be used. So, here we peek into the AVC description,
+								// if present, and switch to software decoding if we find interlaced content.
+								this.decoderConfig = {
+									...this.decoderConfig,
+									hardwareAcceleration: 'prefer-software',
+								};
+							}
+
+							if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+								// Modify the SPS to fix potential loss of B frames
+								record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
+								this.decoderConfig = {
+									...this.decoderConfig,
+									description: serializeAvcDecoderConfigurationRecord(record),
+								};
+							}
+						}
 					}
+				}
+
+				if (!colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
+					// Found via https://github.com/remotion-dev/remotion/issues/10841.
+					// If the color space is incomplete (which is often that it's just partially filled), Chromium has
+					// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
+					// that information is genuinely lost, like the color matrix for example. Chromium has other code
+					// paths where it just fills the missing values with a hardcoded default, so we do the exact same
+					// thing here, with the same hardcoded defaults:
+					this.decoderConfig = {
+						...this.decoderConfig,
+						colorSpace: {
+							primaries: this.decoderConfig.colorSpace?.primaries ?? 'bt709',
+							matrix: this.decoderConfig.colorSpace?.matrix ?? 'bt709',
+							transfer: this.decoderConfig.colorSpace?.transfer ?? 'bt709',
+							fullRange: this.decoderConfig.colorSpace?.fullRange ?? false,
+						},
+					};
 				}
 			}
 
@@ -1035,6 +1092,23 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 						}
 					}
 
+					if (!this.decoderConfig.description) {
+						// Do SPS fixups if necessary
+						for (let i = 0; i < filteredNalUnits.length; i++) {
+							const nalUnit = filteredNalUnits[i]!;
+							if (extractNalUnitTypeForAvc(nalUnit[0]!) !== AvcNalUnitType.SPS) {
+								continue;
+							}
+
+							const sps = parseAvcSps(nalUnit);
+							if (sps && sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+								filteredNalUnits[i] = addAvcBitstreamRestriction(sps);
+							}
+
+							break;
+						}
+					}
+
 					const newData = concatAvcNalUnits(filteredNalUnits, this.decoderConfig);
 					packet = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
 				} else if (this.codec === 'hevc') {
@@ -1112,7 +1186,18 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					this.onError(error);
 				},
 			});
-			this.alphaDecoder.configure(this.decoderConfig);
+			this.alphaDecoder.configure({
+				...this.decoderConfig,
+				// Alpha is always full range, regardless of what the color track says. The decoder only honors the
+				// override if all fields are set tho.
+				colorSpace: {
+					fullRange: true,
+					// These fields are irrelevant:
+					matrix: 'bt709',
+					primaries: 'bt709',
+					transfer: 'bt709',
+				},
+			});
 		}
 
 		const type = determineVideoPacketType(this.codec, this.decoderConfig, packet.sideData.alpha);
@@ -1211,6 +1296,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		sample.setTimestamp(Math.round(sample.timestamp * this.timeResolution) / this.timeResolution);
 		sample.setDuration(Math.round(sample.duration * this.timeResolution) / this.timeResolution);
 		sample.setRotation(this.rotation);
+		sample.setFlip(this.flip);
 
 		this.onSample(sample);
 	}
@@ -1291,8 +1377,13 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			void this.customDecoderCallSerializer.call(() => this.customDecoder!.close());
 		} else {
 			assert(this.decoder);
-			this.decoder.close();
-			this.alphaDecoder?.close();
+
+			if (this.decoder.state !== 'closed') {
+				this.decoder.close();
+			}
+			if (this.alphaDecoder && this.alphaDecoder.state !== 'closed') {
+				this.alphaDecoder.close();
+			}
 
 			this.colorQueue.forEach(x => x.close());
 			this.colorQueue.length = 0;
@@ -1609,7 +1700,25 @@ const colorAlphaMergerWorkerCode = () => {
 			return cpuAlphaBuffer.subarray(0, pixelCount);
 		} else {
 			// For Y-plane-first formats (I*** and NV12), the leading width*height samples are the Y plane
-			return cpuAlphaBuffer.subarray(0, width * height * bytesPerSample);
+			const yPlane = cpuAlphaBuffer.subarray(0, width * height * bytesPerSample);
+
+			if (alpha.colorSpace.fullRange === false) {
+				// Some decoders hand us limited-range alpha, so stretch it back out to full range
+				const bitDepth = format!.includes('P12') ? 12 : format!.includes('P10') ? 10 : 8;
+				const low = 16 << (bitDepth - 8);
+				const high = 235 << (bitDepth - 8);
+				const max = (1 << bitDepth) - 1;
+				const samples = bytesPerSample === 2
+					? new Uint16Array(yPlane.buffer, 0, width * height)
+					: yPlane;
+
+				for (let i = 0; i < samples.length; i++) {
+					const value = Math.round((samples[i]! - low) * max / (high - low));
+					samples[i] = Math.min(Math.max(value, 0), max);
+				}
+			}
+
+			return yPlane;
 		}
 	};
 };
@@ -1680,14 +1789,19 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		onError: (error: unknown) => unknown,
 	) {
 		if (!(await this._track.canDecode())) {
+			if (typeof VideoDecoder === 'undefined') {
+				throw new Error(missingWebCodecsClassMessage('VideoDecoder'));
+			}
+
 			throw new Error(
-				'This video track cannot be decoded by this browser. Make sure to check decodability before using'
+				'This video track cannot be decoded in this environment. Make sure to check decodability before using'
 				+ ' a track.',
 			);
 		}
 
 		const codec = await this._track.getCodec();
 		const rotation = await this._track.getRotation();
+		const flip = await this._track.getFlip();
 		let decoderConfig = await this._track.getDecoderConfig();
 		const timeResolution = await this._track.getTimeResolution();
 		assert(codec && decoderConfig);
@@ -1698,7 +1812,7 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 			optimizeForLatency: this._decoderOptions.optimizeForLatency,
 		};
 
-		return new VideoDecoderWrapper(onSample, onError, codec, decoderConfig, rotation, timeResolution);
+		return new VideoDecoderWrapper(onSample, onError, codec, decoderConfig, rotation, flip, timeResolution);
 	}
 
 	/** @internal */
@@ -1798,13 +1912,18 @@ export type CanvasSinkOptions = {
 	fit?: 'fill' | 'contain' | 'cover';
 	/**
 	 * The clockwise rotation by which to rotate the raw video frame. Defaults to the rotation set in the file metadata.
-	 * Rotation is applied before resizing.
+	 * Rotation is applied before flipping.
 	 */
 	rotation?: Rotation;
 	/**
+	 * Whether to flip the raw video frame horizontally (about the vertical axis). Defaults to the flip set in the file
+	 * metadata. The flip is applied after rotation but before cropping and resizing.
+	 */
+	flip?: boolean;
+	/**
 	 * Specifies the rectangular region of the input video to crop to. The crop region will automatically be clamped to
-	 * the dimensions of the input video track. Cropping is performed after rotation but before resizing. The crop
-	 * region is in the _display pixel space_ of the underlying video data.
+	 * the dimensions of the input video track. Cropping is performed after rotation and flip but before resizing. The
+	 * crop region is in the _display pixel space_ of the underlying video data.
 	 */
 	crop?: CropRectangle;
 	/**
@@ -1820,8 +1939,8 @@ export type CanvasSinkOptions = {
 
 /**
  * A sink that renders video samples (frames) of the given video track to canvases. This is often more useful than
- * directly retrieving frames, as it comes with common preprocessing steps such as resizing or applying rotation
- * metadata.
+ * directly retrieving frames, as it comes with common preprocessing steps such as resizing or applying rotation and
+ * flip metadata.
  *
  * This sink will yield `HTMLCanvasElement`s when in a DOM context, and `OffscreenCanvas`es otherwise.
  *
@@ -1843,6 +1962,8 @@ export class CanvasSink {
 	_fit: 'fill' | 'contain' | 'cover';
 	/** @internal */
 	_rotation: Rotation = 0;
+	/** @internal */
+	_flip = false;
 	/** @internal */
 	_crop?: { left: number; top: number; width: number; height: number };
 	/** @internal */
@@ -1886,6 +2007,9 @@ export class CanvasSink {
 		if (options.rotation !== undefined && ![0, 90, 180, 270].includes(options.rotation)) {
 			throw new TypeError('options.rotation, when provided, must be 0, 90, 180 or 270.');
 		}
+		if (options.flip !== undefined && typeof options.flip !== 'boolean') {
+			throw new TypeError('options.flip, when provided, must be a boolean.');
+		}
 		if (options.crop !== undefined) {
 			validateCropRectangle(options.crop, 'options.');
 		}
@@ -1914,6 +2038,7 @@ export class CanvasSink {
 			const videoTrack = this._videoTrack;
 
 			const rotation = options.rotation ?? await videoTrack.getRotation();
+			const flip = options.flip ?? await videoTrack.getFlip();
 			const squarePixelWidth = await videoTrack.getSquarePixelWidth();
 			const squarePixelHeight = await videoTrack.getSquarePixelHeight();
 
@@ -1946,6 +2071,7 @@ export class CanvasSink {
 			this._width = width;
 			this._height = height;
 			this._rotation = rotation;
+			this._flip = flip;
 			this._crop = crop;
 		})();
 	}
@@ -1983,21 +2109,13 @@ export class CanvasSink {
 		}) as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 		assert(context);
 
-		context.resetTransform();
-
-		if (!canvasIsNew) {
-			if (!this._alpha && isFirefox()) {
-				context.fillStyle = 'black';
-				context.fillRect(0, 0, width, height);
-			} else {
-				context.clearRect(0, 0, width, height);
-			}
-		}
-
-		sample.drawWithFit(context, {
+		sample._drawWithFitAndMipmapping(canvas, context, {
 			fit: this._fit,
 			rotation: this._rotation,
+			flip: this._flip,
 			crop: this._crop,
+			targetIsFresh: canvasIsNew,
+			fillBlack: !this._alpha && isFirefox(),
 		});
 
 		const result = {
@@ -2088,7 +2206,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		const sampleHandler = (sample: AudioSample) => {
 			let sampleTimestamp = sample.timestamp;
 
-			if (this.expectedFirstTimestamp && this.currentTimestamp === null) {
+			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
 				this.timestampOffset = this.expectedFirstTimestamp - sampleTimestamp; ;
 			}
 
@@ -2205,7 +2323,10 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			void this.customDecoderCallSerializer.call(() => this.customDecoder!.close());
 		} else {
 			assert(this.decoder);
-			this.decoder.close();
+
+			if (this.decoder.state !== 'closed') {
+				this.decoder.close();
+			}
 		}
 	}
 }
@@ -2421,8 +2542,12 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		onError: (error: unknown) => unknown,
 	) {
 		if (!(await this._track.canDecode())) {
+			if (typeof AudioDecoder === 'undefined') {
+				throw new Error(missingWebCodecsClassMessage('AudioDecoder'));
+			}
+
 			throw new Error(
-				'This audio track cannot be decoded by this browser. Make sure to check decodability before using'
+				'This audio track cannot be decoded in this environment. Make sure to check decodability before using'
 				+ ' a track.',
 			);
 		}

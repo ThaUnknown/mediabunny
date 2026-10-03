@@ -52,7 +52,7 @@ Mediabunny ships with built-in decoders and encoders for all audio PCM codecs, m
 - `'flac'` - Free Lossless Audio Codec (FLAC) [^flac]
 - `'ac3'` - Dolby Digital (AC-3) [^ac3]
 - `'eac3'` - Dolby Digital Plus (E-AC-3) [^ac3]
-- `'dts'` - Digital Theater Systems (DTS)
+- `'dts'` - DTS Coherent Acoustics [^dts]
 - `'truehd'` - Dolby TrueHD
 - `'alac'` - Apple Lossless Audio Codec (ALAC)
 - `'pcm-u8'` - 8-bit unsigned PCM
@@ -120,6 +120,7 @@ For HLS, the supported codecs depend on the segment format chosen.
 [^mp3]: MP3 encoding is not supported by WebCodecs. You can polyfill it with the [`@mediabunny/mp3-encoder`](./extensions/mp3-encoder) extension package.
 [^flac]: FLAC encoding is not supported by WebCodecs. You can polyfill it with the [`@mediabunny/flac-encoder`](./extensions/flac-encoder) extension package.
 [^ac3]: AC-3 and E-AC-3 are not natively supported by WebCodecs. To encode or decode these codecs, you can use the [`@mediabunny/ac3`](./extensions/ac3) extension package.
+[^dts]: DTS is not natively supported by WebCodecs. To encode or decode it, you can use the [`@mediabunny/dts`](./extensions/dts) extension package.
 [^webm]: WebM only supports a small subset of the codecs supported by Matroska. However, this library can technically read all codecs from a WebM that are supported by Matroska.
 [^webvtt]: WebVTT can only be written, not read.
 
@@ -135,18 +136,18 @@ import { canEncode } from 'mediabunny';
 canEncode('avc'); // => Promise<boolean>
 canEncode('opus'); // => Promise<boolean>
 ```
-Video codecs are checked using 1280x720 @1Mbps, while audio codecs are checked using 2 channels, 48 kHz @128kbps.
+Video codecs are checked using 1280x720, while audio codecs are checked using 2 channels at 48 kHz.
 
 You can also check encodability using specific configurations:
 ```ts
-import { canEncodeVideo, canEncodeAudio } from 'mediabunny';
+import { canEncodeVideo, canEncodeAudio, Quality } from 'mediabunny';
 
 canEncodeVideo('hevc', {
-	width: 1920, height: 1080, bitrate: 1e7
+	width: 1920, height: 1080, frameRate: 60, quality: new Quality({ bitrate: 1e7 })
 }); // => Promise<boolean>
 
 canEncodeAudio('aac', {
-	numberOfChannels: 1, sampleRate: 44100, bitrate: 192e3
+	numberOfChannels: 1, sampleRate: 44100, quality: new Quality({ bitrate: 192e3 })
 }); // => Promise<boolean>
 ```
 
@@ -161,6 +162,7 @@ import {
 	getEncodableVideoCodecs,
 	getEncodableAudioCodecs,
 	getEncodableSubtitleCodecs,
+	Quality,
 } from 'mediabunny';
 
 getEncodableCodecs(); // => Promise<MediaCodec[]>
@@ -172,7 +174,7 @@ getEncodableSubtitleCodecs(); // => Promise<SubtitleCodec[]>
 // Here, we check which of AVC, HEVC and VP8 can be encoded at 1920x1080 @10Mbps:
 getEncodableVideoCodecs(
 	['avc', 'hevc', 'vp8'],
-	{ width: 1920, height: 1080, bitrate: 1e7 },
+	{ width: 1920, height: 1080, quality: new Quality({ bitrate: 1e7 }) },
 ); // => Promise<VideoCodec[]>
 ```
 
@@ -184,6 +186,7 @@ import {
 	getFirstEncodableVideoCodec,
 	getFirstEncodableAudioCodec,
 	getFirstEncodableSubtitleCodec,
+	Quality,
 } from 'mediabunny';
 
 getFirstEncodableVideoCodec(['avc', 'vp9', 'av1']); // => Promise<VideoCodec | null>
@@ -191,7 +194,7 @@ getFirstEncodableAudioCodec(['opus', 'aac']); // => Promise<AudioCodec | null>
 
 getFirstEncodableVideoCodec(
 	['avc', 'hevc', 'vp8'],
-	{ width: 1920, height: 1080, bitrate: 1e7 },
+	{ width: 1920, height: 1080, quality: new Quality({ bitrate: 1e7 }) },
 ); // => Promise<VideoCodec | null>
 ```
 

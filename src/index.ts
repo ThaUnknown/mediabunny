@@ -73,6 +73,7 @@ export {
 	AudioSource,
 	SubtitleSource,
 	AudioBufferSource,
+	type AudioBufferSourceOptions,
 	AudioSampleSource,
 	CanvasSource,
 	EncodedAudioPacketSource,
@@ -122,10 +123,19 @@ export {
 	getFirstEncodableAudioCodec,
 	getFirstEncodableSubtitleCodec,
 	Quality,
+	type QualityOptions,
+	type QualitativeQualityOptions,
+	type QuantitativeQualityOptions,
+	type QualityLevel,
+	// eslint-disable-next-line @typescript-eslint/no-deprecated
 	QUALITY_VERY_LOW,
+	// eslint-disable-next-line @typescript-eslint/no-deprecated
 	QUALITY_LOW,
+	// eslint-disable-next-line @typescript-eslint/no-deprecated
 	QUALITY_MEDIUM,
+	// eslint-disable-next-line @typescript-eslint/no-deprecated
 	QUALITY_HIGH,
+	// eslint-disable-next-line @typescript-eslint/no-deprecated
 	QUALITY_VERY_HIGH,
 } from './encode';
 export {
@@ -167,6 +177,7 @@ export {
 	type Rotation,
 	type SetOptional,
 	type SetRequired,
+	type TransformationMatrix,
 } from './misc';
 export {
 	type TrackType,
@@ -242,6 +253,8 @@ export {
 	InputVideoTrack,
 	InputAudioTrack,
 	type InputTrackQuery,
+	type FrameRateMetrics,
+	type FrameRateMetricsOptions,
 	type PacketStats,
 	asc,
 	desc,
@@ -287,6 +300,8 @@ export {
 	type ConversionOptions,
 	type ConversionVideoOptions,
 	type ConversionAudioOptions,
+	type ConversionCopyOptions,
+	type ConversionExecuteOptions,
 	ConversionCanceledError,
 	type DiscardedTrack,
 } from './conversion';
